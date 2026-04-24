@@ -1,0 +1,86 @@
+##############################################################################
+# INGRESS — sur-appcli-payments-api
+# Expone la API al exterior a través del NGINX Ingress Controller
+# 
+# Cluster: perd3zu1akscapbckcomm001
+# EXTERNAL-IP: 107.240.125.75
+# Hostname: aks-api.sr.bsp.dev.corp
+# Path: /payments-api
+#
+# URL final: https://aks-api.sr.bsp.dev.corp/payments-api
+#
+# Ejemplo de request:
+#   GET https://aks-api.sr.bsp.dev.corp/payments-api/health
+#   → Ingress recibe: /payments-api/health
+#   → Reescribe a: /health (gracias a rewrite-target)
+#   → Service recibe: /health
+#   → Pod recibe: /health en puerto 8080
+##############################################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+
+metadata:
+  name: sur-appcli-payments-api-ingress
+  namespace: appcliente-ns
+  
+  annotations:
+    # Reescribe la ruta: quita el prefijo /payments-api antes de enviar al backend
+    # Ejemplo: /payments-api/transactions → /transactions
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    
+    # Forzar HTTPS (redirigir automáticamente HTTP → HTTPS)
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # Habilitar expresiones regulares en el path
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    
+    # ── Timeouts (opcional, ajustar según necesidad) ──
+    # nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    
+    # ── CORS (opcional, descomentar si tu API lo necesita) ──
+    # nginx.ingress.kubernetes.io/enable-cors: "true"
+    # nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    # nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    # nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    
+    # ── Rate limiting (opcional) ──
+    # nginx.ingress.kubernetes.io/limit-rps: "100"
+
+spec:
+  # Clase del Ingress Controller
+  ingressClassName: nginx
+
+  # ── TLS: Certificado para HTTPS ──
+  tls:
+    - hosts:
+        - aks-api.sr.bsp.dev.corp
+      # Certificado TLS compartido (copiar a appcliente-ns si no existe)
+      secretName: aks-backend-tls
+
+  # ── REGLAS DE ENRUTAMIENTO ──
+  rules:
+    - host: aks-api.sr.bsp.dev.corp
+      http:
+        paths:
+          # Path pattern con regex:
+          # - /payments-api       → match exacto del prefijo
+          # - (/|$)               → seguido por "/" o fin de línea
+          # - (.*)                → captura el resto (grupo 2, usado en rewrite-target)
+          - path: /payments-api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: sur-appcli-payments-api-service   # ← Nombre del Service
+                port:
+                  number: 80                            # ← Puerto del Service
+          
+          # Customer Access Identity API
+          - path: /customer-access-identity-api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: sur-appcli-customer-access-identity-api-service
+                port:
+                  number: 80

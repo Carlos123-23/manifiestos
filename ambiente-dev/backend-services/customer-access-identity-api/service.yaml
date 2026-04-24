@@ -1,0 +1,27 @@
+##############################################################################
+# SERVICE — sur-appcli-customer-access-identity-api
+# Expone el Deployment internamente en el cluster.
+# El Ingress enruta tráfico a este Service.
+#
+# Flujo: Ingress(:443) → Service(:80) → Pod(:8085)
+##############################################################################
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: sur-appcli-customer-access-identity-api-service
+  namespace: appcliente-ns
+
+spec:
+  # ClusterIP: solo accesible dentro del cluster (el Ingress lo expone al exterior)
+  type: ClusterIP
+
+  # Selector: debe coincidir con las labels del Deployment
+  selector:
+    app: sur-appcli-customer-access-identity-api
+
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80            # ← Puerto que expone el Service (Ingress llama aquí)
+      targetPort: 8085    # ← Puerto del contenedor (containerPort del Deployment)
