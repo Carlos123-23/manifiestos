@@ -1,0 +1,4 @@
+- ci_id: OAM-CI-ID
+  configuration_files:
+    - .gluon/cd/values.yml
+    - .gluon/cd/pro/values-pro.yml

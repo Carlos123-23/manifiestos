@@ -1,0 +1,1410 @@
+name: Container build and push application
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      env-vars-json:
+        required: true
+        type: string
+      git-ref:
+        required: true
+        type: string
+      technology:
+        required: true
+        type: string
+      tag-version:
+        required: false
+        type: string
+      isReleaseWorkflow:
+        required: false
+        type: boolean
+      environment_type:
+        type: string
+        description: "Environment for filter the registries list: cert, pre or pro."
+        required: true
+      origin-environment:
+        type: string
+        description: "Environment for filter the registries to artifactory"
+        required: false
+      # The following input branch-strategy is not used in the workflow so it
+      # can be removed after checking all workflows calls and references
+      branch-strategy:
+        type: string
+        description: "Branch strategy, trunk-based or gitflow"
+        default: 'gitflow'
+        required: false
+      scan-image:
+        type: string
+        description: "Flag to enable or disable the image scan"
+        required: false
+        default: 'true'
+      qg-enabled:
+        required: false
+        type: boolean
+        default: true
+      repository:
+        required: false
+        type: string
+      deploy-target-enabled:
+        required: false
+        type: string
+        default: 'false'
+      component:
+        type: string
+        description: "Component name"
+        required: false
+    outputs:
+      tag-version:
+        description: ''
+        value: ${{ jobs.container-build-and-push.outputs.tag-version }}
+      publish-artifact:
+        description: ''
+        value: ${{ jobs.container-build-and-push.outputs.publish-artifact }}
+
+jobs:
+  container-build-and-push:
+    name: Container build and push application
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment_type }}
+    outputs:
+      tag-version: ${{ env.TAG_VERSION }}
+      data-json: ${{ steps.push-scan.outputs.data-json || '["None"]' }}
+      scan-exit-code: ${{ steps.sysdig-scan.outputs.exitcode }}
+      scan-result-url: ${{ steps.sysdig-scan.outputs.resulturl }}
+      waiver-scan-type: ${{ steps.get-waiver-scan.outputs.EXCEPTION_TYPE || 'None' }}
+      waiver-scan-id: ${{ steps.get-waiver-scan.outputs.waiver-id || 'None' }}
+      publish-artifact: ${{ steps.publish-artifacts.outputs.publish-artifact || steps.publish-artifacts-maven.outputs.publish-artifact || steps.publish-artifacts-python.outputs.publish-artifact || 'false' }}
+    env:
+      MAVEN_OPTS: ${{ fromJSON(inputs.env-vars-json).MAVEN_OPTS }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git-ref }}
+          fetch-depth: 0
+      - name: Get JFrog access token
+        id: jfrog-token
+        uses: santander-group-shared-assets/gln-alm-jfrog-oidc-token-action@1.0.1
+        with:
+          url: ${{ vars.JFROG_PLATFORM_URL }}
+          audience: ${{ vars.JFROG_AUDIENCE }}
+          provider_name: ${{ vars.JFROG_PROVIDER_NAME }}
+      # Java_Maven technology
+      - name: Setup Java/Maven tools
+        if: ${{ inputs.technology == 'Java_Maven' }}
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.1.0
+        with:
+          tools_and_versions: >
+            java:${{ fromJSON(inputs.env-vars-json).JAVA_VERSION }},
+            maven:${{ fromJSON(inputs.env-vars-json).MAVEN_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+          maven_settings: ${{ vars.MAVEN_SETTINGS_TEMPLATE || vars.MAVEN_SETTINGS_URL || fromJSON(inputs.env-vars-json).MAVEN_SETTINGS_URL }}
+      - name: Generate artifact files with maven
+        if: ${{ inputs.technology == 'Java_Maven' }}
+        shell: bash
+        run: |
+          artifact_native_compilation=${{ fromJSON(inputs.env-vars-json).ARTIFACT_NATIVE_COMPILATION }}
+          if [[ $artifact_native_compilation == true ]]; then
+            mvn native:compile -Pnative -Dmaven.test.skip=true
+          else
+            mvn clean package -Dmaven.test.skip=true
+          fi
+
+      # Starting request to component-manager to check if the component config deploy type is 'artifact'
+      - name: Generate Corporate Token
+        if: ${{ inputs.technology == 'npm' || inputs.technology == 'Java_Maven' || inputs.technology == 'python'}}
+        id: login-management
+        uses: santander-group-shared-assets/gln-corporate-login-action@1.4.0
+        with:
+          sts_url: ${{ fromJSON(inputs.env-vars-json).STS_LOGIN_URL }}
+          login_url: ${{ fromJSON(inputs.env-vars-json).CORPORATE_LOGIN_API_URL }}
+          login_user: ${{ secrets.CORPORATE_LOGIN_USER }}
+          login_password: ${{ secrets.CORPORATE_LOGIN_PASSWORD }}
+      - name: Get information from Component Manager
+        if: ${{ inputs.technology == 'npm' || inputs.technology == 'Java_Maven' || inputs.technology == 'python'}}
+        id: get-component-manager-info
+        env:
+          API_MANAGEMENT_ENDPOINT: ${{ fromJSON(inputs.env-vars-json).MANAGMENT_API_URL }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        shell: bash
+        run: |
+          # Function to get template id and version
+          call_management_api() {
+            local endpoint="$1"
+            local request_params="$2"
+            local command="curl --silent \
+              $request_params \
+              -H 'Authorization: Bearer ${{ steps.login-management.outputs.token }}' \
+              -w "%{http_code}" \
+              $endpoint"
+            local data_response=$(eval "$command" | jq -rc .)
+            local status_code=${data_response: -3}
+            local data=${data_response::-3}
+            # Validate the response status
+            if [[ "$status_code" =~ ^2.* ]]; then
+              echo "::debug::Response status code: $status_code" >&2
+              echo "::debug::Data response: $data" >&2
+            else
+              local title=$(jq -r '.title' <<<$data)
+              local detail=$(jq -r '.detail' <<<$data)
+              echo "::error::$title. $detail." >&2
+              echo "::error::Response status code: $status_code" >&2
+              exit 1
+            fi
+            echo "$data"
+          }
+      
+          # Function to get component configuration
+          call_configuration_api() {
+            local component_id="$1"
+            local endpoint="${{ env.API_MANAGEMENT_ENDPOINT }}/components/$component_id/configuration"
+            local command="curl --silent \
+              -X GET \
+              -H 'accept: application/json' \
+              -H 'Authorization: Bearer ${{ steps.login-management.outputs.token }}' \
+              -w "%{http_code}" \
+              $endpoint"
+            local data_response=$(eval "$command" | jq -rc .)
+            local status_code=${data_response: -3}
+            local data=${data_response::-3}
+            # Validate the response status
+            if [[ "$status_code" =~ ^2.* ]]; then
+              echo "::debug::Response status code: $status_code" >&2
+              echo "::debug::Data response: $data" >&2
+            else
+              local title=$(jq -r '.title' <<<$data)
+              local detail=$(jq -r '.detail' <<<$data)
+              echo "::error::$title. $detail." >&2
+              echo "::error::Response status code: $status_code" >&2
+              exit 1
+            fi
+            echo "$data"
+          }
+      
+          # Getting component id
+          api_management_endpoint="${{ env.API_MANAGEMENT_ENDPOINT }}/components?sourceCodeRepository=${{ github.event.repository.html_url }}.git"
+          api_request_params="-X GET -H 'Content-Type: application/vnd.gluon.component-list.v1+json'"
+          component_response=$(call_management_api "$api_management_endpoint" "$api_request_params")
+
+          component_content=$(jq -rc '.content[0]' <<<"$component_response")
+          component_id=$(jq -r '.id' <<<"$component_content")
+
+          if [[ "$component_id" == "null" ]] || [ -z "$component_id" ]; then
+            echo "::error::Component ID not found!"
+            exit 1
+          fi
+
+          # Getting template id and version
+          api_management_endpoint="${{ env.API_MANAGEMENT_ENDPOINT }}/components/$component_id"
+          api_request_params_v2="-X GET -H 'Content-Type: application/vnd.gluon.component.v1+json' -H 'accept: application/vnd.gluon.component.v2+json'"
+          component_information_response=$(call_management_api "$api_management_endpoint" "$api_request_params_v2")
+        
+          template_id=$(jq -r '.template.id' <<<"$component_information_response")
+          template_version=$(jq -r '.template.current_version.name' <<<"$component_information_response")
+
+          if [ -z "$template_id" ] || [ -z "$template_version" ]; then
+            echo "::error::Template ID or Version not found!"
+            exit 1
+          fi
+
+          # Getting Component Template information
+          template_name=$(jq -r '.template.name' <<<"$component_information_response")
+          get_template_endpoint="${{ env.API_MANAGEMENT_ENDPOINT }}/catalog/templates/$template_id"
+          catalog_response=$(call_management_api "$get_template_endpoint" "$api_request_params")
+          repository_template=$(jq -r '.repository_template' <<<"$catalog_response")
+          repository_template_organization=$(echo $repository_template | cut -d'/' -f1)
+          # Set output variables
+          echo "component_id=$component_id" >> $GITHUB_OUTPUT
+          echo "template_id=$template_id" >> $GITHUB_OUTPUT
+          echo "repository_template=$repository_template" >> $GITHUB_OUTPUT
+          echo "repository_template_organization=$repository_template_organization" >> $GITHUB_OUTPUT
+          echo "template_version=$template_version" >> $GITHUB_OUTPUT
+          echo "template_name=$template_name" >> $GITHUB_OUTPUT
+      
+          # Call configuration API
+          configuration_response=$(call_configuration_api "$component_id")
+          echo "configuration_response=$configuration_response"
+          echo "configuration_response=$configuration_response" >> $GITHUB_OUTPUT
+      - name: Extract labels
+        if: ${{ inputs.technology == 'npm' || inputs.technology == 'Java_Maven' || inputs.technology == 'python' }}
+        id: extract-labels
+        run: |
+          deploy=$(echo '${{ steps.get-component-manager-info.outputs.configuration_response }}' | jq -r '.configuration.publish')
+          echo "deploy=$deploy"
+          
+          if echo "$deploy" | grep -q "artifact"; then
+            echo "publish_artifact=true" >> $GITHUB_OUTPUT
+            echo "publish_artifact: true"
+            if [ "${{ inputs.technology }}" == "npm" ] && [ "${{ fromJSON(inputs.env-vars-json).ARTIFACT_PUBLISH_TARGET }}" == "none" ]; then
+              WARN_APP_GROUP_IS_NOT_CONFIGURED="⚠️ WARNING!! The component template is able to be published as an artifact, but you're configuring the ARTIFACT_PUBLISH_TARGET in .gluon/ci/properties.env as 'none' so.. it will not be published!!"
+              echo "$WARN_APP_GROUP_IS_NOT_CONFIGURED" >> $GITHUB_STEP_SUMMARY
+              echo "$WARN_APP_GROUP_IS_NOT_CONFIGURED"
+            fi
+          else
+            echo "publish_artifact=false" >> $GITHUB_OUTPUT
+            echo "publish_artifact: false"
+          fi
+          
+          # Check deployment conditions and set publish_artifact to false if conditions are not met
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ inputs.deploy-target-enabled }}" != "true" ]]; then
+            echo "publish_artifact=false" >> $GITHUB_OUTPUT
+            echo "publish_artifact: false (deployment conditions not met)"
+          elif [[ "${{ github.event_name }}" != "pull_request" && "${{ github.ref }}" == refs/heads/feature/* ]]; then
+            echo "publish_artifact=false" >> $GITHUB_OUTPUT
+            echo "publish_artifact: false (feature branch without PR)"
+          fi
+      - name: Get release version Npm
+        if: ${{ inputs.technology == 'npm' }}
+        id: get-version-npm
+        uses: santander-group-shared-assets/gln-alm-version-manager-action@v1.14.0
+        with:
+          version_file: 'package.json'
+          suffix: 'BETA'
+          suffix_process: 'add'
+      - name: Get project version Npm
+        if: ${{ inputs.technology == 'npm' }}
+        id: current-version
+        shell: bash
+        run: |
+          isReleaseWorkflow=${{ inputs.isReleaseWorkflow }}
+          if [[ "$isReleaseWorkflow" == "true" ]]; then
+            echo "version=${{ inputs.tag-version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ steps.get-version-npm.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup NodeJs tools
+        if: ${{ inputs.technology == 'npm' && fromJSON(inputs.env-vars-json).NODE_VERSION != '' }}
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.2.0
+        with:
+          tools_and_versions: >
+            nodejs:${{ fromJSON(inputs.env-vars-json).NODE_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+          npm_settings: ${{ vars.NPM_SETTINGS_TEMPLATE || vars.NPM_SETTINGS_URL || fromJSON(inputs.env-vars-json).NPM_SETTINGS_URL }}
+
+      - name: Apply NPM settings template to project
+        if: |
+          inputs.technology == 'npm' &&
+          fromJSON(inputs.env-vars-json).NODE_VERSION != '' &&
+          vars.NPM_SETTINGS_TEMPLATE &&
+          hashFiles('.npmrc') != ''
+        env:
+          NPM_SETTINGS: ${{ vars.NPM_SETTINGS_TEMPLATE }}
+        run: |
+          echo "Merging NPM settings template into project .npmrc..."
+
+          echo "::debug::Template content:"
+          echo "::debug::$NPM_SETTINGS"
+          echo "::debug::---"
+          if [ "${RUNNER_DEBUG:-0}" = "1" ] || [ "${ACTIONS_STEP_DEBUG:-false}" = "true" ]; then
+            echo "::debug::=== Project .npmrc before merge ==="
+            cat .npmrc
+            echo ""
+          fi
+
+          # Process template and merge with existing .npmrc
+          echo "$NPM_SETTINGS" | while IFS='=' read -r key value; do
+            # Skip empty lines and comments
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+
+            echo "::debug::Processing key='$key' value='$value'"
+
+            # Replace all environment variables with format ${env.VARIABLE}
+            while [[ "$value" =~ \$\{env\.([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+              var_name="${BASH_REMATCH[1]}"
+              var_value="${!var_name}"
+              echo "::debug::Replacing \${env.${var_name}} with '$var_value'"
+              value="${value//\$\{env.${var_name}\}/$var_value}"
+            done
+
+            # Trim whitespace from key and value
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+
+            echo "::debug::Final key='$key' value='$value'"
+
+            # Update or add the configuration
+            if grep -q "^${key}[[:space:]]*=" .npmrc; then
+              echo "::debug::Updating $key in .npmrc"
+              sed -i "s|^${key}[[:space:]]*=.*|${key}=${value}|" .npmrc
+            else
+              echo "::debug::Adding $key to .npmrc"
+              # Ensure .npmrc ends with newline before appending
+              [ -n "$(tail -c 1 .npmrc)" ] && echo "" >> .npmrc
+              echo "${key}=${value}" >> .npmrc
+            fi
+          done
+
+          if [ "${RUNNER_DEBUG:-0}" = "1" ] || [ "${ACTIONS_STEP_DEBUG:-false}" = "true" ]; then
+            echo "::debug::=== Project .npmrc after merge ==="
+            cat .npmrc
+            echo ""
+
+            echo "::debug::=== npm config list ==="
+            npm config list
+          fi
+
+      - name: Prepare artifact files with npm
+        if: ${{ inputs.technology == 'npm' }}
+        shell: bash
+        run: |
+          # Set project path and retrieve application name
+          PACKAGE_PATH="${{ fromJSON(inputs.env-vars-json).NPM_LIBRARY_DIRECTORY || './' }}"
+          application_name=$(jq -r '.name' "$PACKAGE_PATH/package.json" | sed 's:.*/::')
+
+          # Set version and artifact paths
+          version="${{ steps.current-version.outputs.version }}"
+          ARTIFACT_PATH="./$application_name-$version.zip"
+          CONFIG_PATH="./$application_name-$version-config.zip"
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+          echo "CONFIG_PATH=$CONFIG_PATH" >> $GITHUB_ENV
+
+          # Run npm install and build
+          ${{ fromJSON(inputs.env-vars-json).NPM_RUN_INSTALL_COMMAND }} && ${{ fromJSON(inputs.env-vars-json).NPM_RUN_BUILD_COMMAND }}
+
+      - name: Generate Npm Artifact Zip
+        if: ${{ inputs.technology == 'npm' }}
+        run: |
+          cd ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_DIRECTORY }}
+          zip -r ${GITHUB_WORKSPACE}/${{env.ARTIFACT_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_CONTENT }}
+
+      - name: Generate Npm Config Zip
+        if: ${{ inputs.technology == 'npm' }}
+        id: config-file
+        run: |
+          config_file_exists="false"
+          if [[ -d "${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_DIRECTORY }}" ]]; then
+            zip -r ${GITHUB_WORKSPACE}/${{env.CONFIG_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_DIRECTORY }}/${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_CONTENT }}
+            config_file_exists="true"
+            else
+            echo "Configuration directory not found"
+          fi
+          echo "exists=$config_file_exists" >> $GITHUB_OUTPUT
+  
+      # Prepare artifacts and push to nexus just in case the component config has deploy type 'artifact'
+      - name: Prepare Artifacts Npm
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'npm' && fromJSON(inputs.env-vars-json).ARTIFACT_PUBLISH_TARGET != 'none' }}
+        id: prepare-artifacts
+        uses: santander-group-shared-assets/gln-artifact-registry-url-application-action@1.5.0
+        with:
+          env-vars-json: ${{ inputs.env-vars-json }}
+          action-vars-json: ${{ toJSON(vars) }}
+          parameters: >
+            version: ${{ steps.current-version.outputs.version }},
+            artifactType: artifact,
+            group: ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_GROUP }}
+
+      - name: Publish Artifacts Npm
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'npm' && fromJSON(inputs.env-vars-json).ARTIFACT_PUBLISH_TARGET != 'none' }}
+        id: publish-artifacts
+        shell: bash
+        env:
+          JFROG_TOKEN: ${{ steps.jfrog-token.outputs.token }}
+        run: |
+          ca_file=$(npm config get cafile)
+          
+          # Function to upload artifacts to JFrog
+          uploadJfrog() {
+            echo "🚀 Uploading artifacts to JFrog..."
+            
+            # Upload application artifact
+            artifact_file="${{ fromJSON(steps.prepare-artifacts.outputs.results).artifact-file-name }}"
+            upload_url="${{ fromJSON(steps.prepare-artifacts.outputs.results).artifact-upload-url }}"
+            
+            echo "📁 Local file: $artifact_file"
+            echo "📦 Uploading artifact to: $upload_url"
+            
+            # Check if artifact file exists and is not empty
+            if [[ -z "$artifact_file" ]]; then
+              echo "::error::❌ Artifact file name is empty"
+              exit 1
+            fi
+            
+            if [[ ! -f "$artifact_file" ]]; then
+              echo "::error::❌ Artifact file does not exist: $artifact_file"
+              exit 1
+            fi
+            
+            response=$(curl --cacert $ca_file -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${JFROG_TOKEN}" \
+              -X PUT "$upload_url" \
+              --data-binary "@$artifact_file")
+            
+            if [[ "$response" =~ ^(200|201)$ ]]; then
+              echo '✅ Application artifact uploaded successfully'
+            else
+              echo "::error::❌ Error while uploading application artifact: $response"
+              exit 1
+            fi
+
+            # Upload configuration artifact if exists
+            if [[ "${{ steps.config-file.outputs.exists }}" == "true" ]]; then
+              config_file="${{ fromJSON(steps.prepare-artifacts.outputs.results).config-artifact-file-name }}"
+              config_upload_url="${{ fromJSON(steps.prepare-artifacts.outputs.results).config-artifact-upload-url }}"
+              
+              echo "⚙️ Config file: $config_file"
+              echo "⚙️ Uploading config to: $config_upload_url"
+              
+              # Check if config file exists and is not empty
+              if [[ -z "$config_file" ]]; then
+                echo "::error::❌ Config file name is empty"
+                exit 1
+              fi
+              
+              if [[ ! -f "$config_file" ]]; then
+                echo "::error::❌ Config file does not exist: $config_file"
+                exit 1
+              fi
+
+              response=$(curl --cacert $ca_file -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${JFROG_TOKEN}" \
+                -X PUT "$config_upload_url" \
+                --data-binary "@$config_file")
+              
+              if [[ "$response" =~ ^(200|201)$ ]]; then
+                echo '✅ Configuration artifact uploaded successfully.'
+              else
+                echo "::error::❌ Error while uploading configuration artifact: $response"
+                exit 1
+              fi
+            fi
+            echo "publish-artifact=true" >> $GITHUB_OUTPUT
+          }
+          
+          uploadJfrog
+
+      - name: Get release version Maven
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'Java_Maven' }}
+        id: get-version-maven
+        uses: santander-group-shared-assets/gln-alm-version-manager-action@v1.11.0
+        with:
+          version_file: 'pom.xml'
+          suffix: 'SNAPSHOT'
+          suffix_process: 'add'
+      - name: Get project version Maven
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'Java_Maven' }}
+        id: current-version-maven
+        run: |
+          isReleaseWorkflow=${{ inputs.isReleaseWorkflow }}
+          if [[ "$isReleaseWorkflow" == "true" ]]; then
+            echo "version=${{ inputs.tag-version }}"
+            echo "version=${{ inputs.tag-version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ steps.get-version-maven.outputs.version }}"
+            echo "version=${{ steps.get-version-maven.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+      - name: Nexus Publish Artifacts Maven
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'Java_Maven' }}
+        id: publish-artifacts-maven
+        env:
+          SGT_DESPLOYSGTPRO_USER_NEXTGEN: ${{ secrets.SGT_DESPLOYSGTPRO_USER_NEXTGEN }}
+          SGT_DESPLOYSGTPRO_PASSWORD_NEXTGEN: ${{ secrets.SGT_DESPLOYSGTPRO_PASSWORD_NEXTGEN }}
+          REPOSITORY_USERNAME: ${{ secrets.REPOSITORY_USERNAME }}
+          REPOSITORY_PASSWORD: ${{ secrets.REPOSITORY_PASSWORD }}
+        run: |
+          maven_repo=""
+          maven_deployment_env="" 
+          echo "app_version=${{ steps.current-version-maven.outputs.version }}"
+          app_version=${{ steps.current-version-maven.outputs.version }}
+          settings_file=$(mvn help:effective-settings | sed -n '/<settings/,/<\/settings>/p')
+          snapshot_repo=$(echo $settings_file | grep -o '<altSnapshotDeploymentRepository>[^<]*' | sed 's/<altSnapshotDeploymentRepository>//')
+          release_repo=$(echo $settings_file | grep -o '<altReleaseDeploymentRepository>[^<]*' | sed 's/<altReleaseDeploymentRepository>//')
+          
+          if [[ "$app_version" == *"-SNAPSHOT"* ]]; then
+            maven_deployment_env=$snapshot_repo
+            repository_url=$(echo $snapshot_repo | grep -o 'http.*' | rev | cut -d'/' -f2- | rev)
+          else
+            maven_deployment_env=$release_repo
+            repository_url=$(echo $release_repo | grep -o 'http.*' | rev | cut -d'/' -f2- | rev)
+          fi
+          
+          echo "repository_url=$repository_url" >> $GITHUB_OUTPUT
+          echo "::notice::Deployment Repository $maven_deployment_env"
+          mvn versions:set -DnewVersion=$app_version -DprocessAllModules
+          mvn -B clean deploy ${{ fromJSON(inputs.env-vars-json).MAVEN_ARGS }} ${{ fromJSON(inputs.env-vars-json).MAVEN_DEPLOY_ARGS }} -DaltDeploymentRepository="$maven_deployment_env"
+          echo "publish-artifact=true" >> $GITHUB_OUTPUT
+      - name: Get project version Python
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'python' }}
+        id: current-version-python      
+        uses: santander-group-shared-assets/gln-alm-version-manager-action@v1.14.0
+        with:
+          version_file: 'setup.py'
+          suffix: 'RC'
+          suffix_process: 'add'
+      - name: Nexus Publish Artifacts Python
+        if: ${{ steps.extract-labels.outputs.publish_artifact == 'true' && inputs.technology == 'python' }}
+        id: publish-artifacts-python
+        run: |
+          echo "::debug::PYTHON_BUILD_COMMAND:${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}"
+          echo "::debug::PYTHON_RELEASE_REPOSITORY:${{ vars.PYTHON_RELEASE_REPOSITORY || fromJSON(inputs.env-vars-json).PYTHON_RELEASE_REPOSITORY }}"
+          echo "::debug::PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}"
+          echo "::debug::PIP_COMPONENTS_INSTALL_COMMAND:${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}"
+          echo "::debug::PYTHON_REQUIREMENTS_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}"
+          echo "::debug::UPLOAD_REPOSITORY_URL:${{ vars.UPLOAD_REPOSITORY_URL || fromJSON(inputs.env-vars-json).UPLOAD_REPOSITORY_URL }}"
+          echo "::debug::PYTHON_RELEASE_REPOSITORY:${{ vars.PYTHON_RELEASE_REPOSITORY || fromJSON(inputs.env-vars-json).PYTHON_RELEASE_REPOSITORY }}"
+          echo "::debug::PYTHON_SNAPSHOT_REPOSITORY:${{ vars.PYTHON_SNAPSHOT_REPOSITORY || fromJSON(inputs.env-vars-json).PYTHON_SNAPSHOT_REPOSITORY }}"
+          echo "::debug::PYTHON_DIST_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_DIST_DIRECTORY }}"          
+          
+          ${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}
+          python_repository=""
+          isReleaseWorkflow=${{ inputs.isReleaseWorkflow }}
+          if [[ "$isReleaseWorkflow" == "true" ]]; then
+            python_repository=${{ vars.PYTHON_RELEASE_REPOSITORY || fromJSON(inputs.env-vars-json).PYTHON_RELEASE_REPOSITORY }}
+          else
+            python_repository=${{ vars.PYTHON_SNAPSHOT_REPOSITORY || fromJSON(inputs.env-vars-json).PYTHON_SNAPSHOT_REPOSITORY }}
+          fi
+          echo "python_repository:$python_repository"
+          python -m venv ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}
+          . ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}/bin/activate
+          python -m pip install --upgrade pip
+          dist_directory="${{ fromJSON(inputs.env-vars-json).PYTHON_DIST_DIRECTORY }}"          
+          if [[ ! -d "${dist_directory}" ]]; then
+            mkdir -p "${dist_directory}" || echo "Warning in the creation of the dist directory"
+          fi
+          ${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}
+          pip install -v -r ${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}
+
+          if [[ "$isReleaseWorkflow" == "true" ]]; then
+            version=${{ inputs.tag-version }}
+          else
+            version=${{ steps.current-version-python.outputs.version }}
+          fi
+
+          if [[ -f "version.py" ]]; then
+            echo "Setting version in version.py..."
+            sed -i "s/__version__\\s*=\\s*['\"].*['\"]/__version__='${version}'/g" version.py
+            if [[ -f "setup.py" && "$(grep -c '__version__\s*=\s*['\"].*['\"]' version.py)" -eq 0 ]]; then
+              echo "Version not set on version.py, setting in setup.py..."
+              sed -i "s/version\s*=\s*['\"].*['\"]/version='${version}'/g" setup.py
+            fi
+          elif [[ -f "setup.py" ]]; then
+            echo "Setting version in setup.py..."
+            sed -i "s/version\\s*=\\s*['\"].*['\"]/version='${version}'/g" setup.py
+          else
+            echo "Error: Failed to set version (setup.py, version.py, or setup.cfg not found)."
+            exit 1
+          fi
+          
+          echo "version=$version" >> $GITHUB_OUTPUT
+          python setup.py sdist bdist_wheel --dist-dir "${dist_directory}"
+          project_name=$(python setup.py --name)
+          repository_url="${{ vars.UPLOAD_REPOSITORY_URL || fromJSON(inputs.env-vars-json).UPLOAD_REPOSITORY_URL }}/$python_repository/"
+          repository_url="https://$(echo $repository_url | sed -E 's/^\s*.*:\/\///g')"
+          echo "::debug::repository_url:${repository_url}"
+          python -m twine upload --verbose -u ${{ secrets.REPOSITORY_USERNAME || secrets.SGT_DESPLOYSGTPRO_USER_NEXTGEN }} -p ${{ secrets.REPOSITORY_PASSWORD || secrets.SGT_DESPLOYSGTPRO_PASSWORD_NEXTGEN }} --repository-url $repository_url "${dist_directory}/*"          
+          echo "publish-artifact=true" >> $GITHUB_OUTPUT
+      # Python technology
+      - name: Setup Python tools
+        if: inputs.technology == 'python'
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.1.0
+        with:
+          tools_and_versions: >
+            python:${{ fromJSON(inputs.env-vars-json).PYTHON_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+      - name: Generate artifact files with Python
+        if: inputs.technology == 'python'
+        shell: bash {0}
+        run: |
+          echo "::debug::PYTHON_BUILD_COMMAND:${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}"
+          echo "::debug::PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}"
+          echo "::debug::PIP_COMPONENTS_INSTALL_COMMAND:${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}"
+          echo "::debug::PYTHON_REQUIREMENTS_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}"
+          echo "::debug::PYTHON_TEST_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_DIRECTORY }}"
+          echo "::debug::PYTHON_SKIP_TEST:${{ fromJSON(inputs.env-vars-json).PYTHON_SKIP_TEST }}"
+          echo "::debug::PYTHON_TEST_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_PATH }}"
+          ${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}
+          python -m venv ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}
+          . ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}/bin/activate
+          python -m pip install --upgrade pip
+          ${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}
+          pip install -v -r ${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}
+          if [[ -d "${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_DIRECTORY }}" ]]; then
+            if [[ "${{ fromJSON(inputs.env-vars-json).PYTHON_SKIP_TEST }}" == "false" ]]; then
+              export LC_ALL=C.UTF-8
+              export LANG=C.UTF-8
+              pip install pytest pytest-cov
+              python -m pytest --verbose --junit-xml ${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_PATH }} --cov-report=xml --cov
+            fi
+          fi
+      - name: Get project version
+        if: inputs.technology == 'python'
+        id: python-project-version
+        uses: santander-group-shared-assets/gln-alm-version-manager-action@v1.14.0
+        with:
+          version_file: 'setup.py'
+      - name: Generate Python Artifact Zip
+        if: ${{ inputs.technology == 'python' }}
+        shell: bash {0}
+        run: |
+          # cd ${{ fromJSON(inputs.env-vars-json).PYTHON_DIST_DIRECTORY }}
+          # zip -r ${GITHUB_WORKSPACE}/${{env.ARTIFACT_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_CONTENT }}
+          project_name=$(python setup.py --name)
+          ARTIFACT_PATH=dist/$project_name-${{ steps.python-project-version.outputs.version }}.tar.gz
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH"
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+  
+      - name: Setting tag version
+        id: tag
+        # Add a logic to update the version when is a main branch and set the new version to the TAG_VERSION variable
+        run: |
+          if [ -n "${{ inputs.tag-version }}" ]; then
+            tag="${{ inputs.tag-version }}"
+          else
+            tag="${GITHUB_REF##*/}"
+          fi
+          taguuid=`uuidgen`
+          echo "TAG_UUID=${taguuid}" >> $GITHUB_OUTPUT
+          echo "TAG_VERSION=$tag" >> $GITHUB_ENV
+
+      - name: Container tool build
+        id: 'build'
+        run: |
+          artifact_native_compilation=${{ fromJSON(inputs.env-vars-json).ARTIFACT_NATIVE_COMPILATION }}
+          if [[ $artifact_native_compilation == true ]]; then
+            file_name="Dockerfile.native"
+          else
+            file_name="Dockerfile"
+          fi
+          buildah bud \
+            --file $file_name \
+            --format docker \
+            --no-cache ${{ fromJSON(inputs.env-vars-json).CONTAINER_BUILD_ARGUMENTS || fromJSON(inputs.env-vars-json).DOCKER_BUILD_ARGUMENTS }} \
+            --label "github-commit-hash=${GITHUB_SHA}" \
+            --label "github-repository=${GITHUB_REPOSITORY}" \
+            --tag ${{ vars.ACR_DESTINATION }}.azurecr.io/${GITHUB_REPOSITORY}:${{ env.TAG_VERSION }} .
+          
+
+      - name: Waiver SCAN - check-waiver-scan
+        id: 'get-waiver-scan'
+        uses: santander-group-shared-assets/gln-rca-ssdlc-waivers@v1
+        with:
+          waiver_type: "Container Image Analysis"
+          repository: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+          application_id: ${{ vars.application_id || secrets.application_id }}
+          application_private_key: ${{ secrets.application_private_key }}
+
+      - name: Call image Sysdig scanner for basic image
+        if: ${{ inputs.scan-image == 'true' || (inputs.qg-enabled && startsWith(github.ref_name, 'feature/')) }}
+        id: 'sysdig-scan'
+        uses: santander-group-shared-assets/gln-detect-asm-sysdig-imagescan-action@v2
+        with:
+          CONTAINER_ENGINE: "podman"
+          IMAGE_LOCAL_NAME: "${{ steps.tag.outputs.TAG_UUID }}"
+          SYSDIG_TKN: ${{ secrets.SYSDIG_TKN }}
+          EXCEPTION_TYPE: ${{ steps.get-waiver-scan.outputs.EXCEPTION_TYPE }}
+
+      - name: Send Sysdig information to data search engine tool
+        if: always() && !cancelled() && steps.sysdig-scan.outcome != 'skipped'
+        uses: santander-group-shared-assets/gln-post-elastic-search-action@2.5.0
+        with:
+          elastic-instance: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_API_URL }}
+          elastic-alias: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_ALIAS }}
+          elastic-type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_TYPE }}
+          elastic-auth-type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_AUTH_TYPE }}
+          elastic-token: ${{ secrets.ELASTICSEARCH_API_KEY_PRO }}
+          job-type: 'sysdig'
+          technology: ${{ inputs.technology }} 
+          parameters: >       
+            SCAN_RESULT=${{ steps.sysdig-scan.outputs.exitcode }}
+            SCAN_LOG_URL=${{ steps.sysdig-scan.outputs.resulturl }}
+            WAIVER=${{ steps.get-waiver-scan.outputs.EXCEPTION_TYPE || 'None' }}
+            WAIVER_ID=${{ steps.get-waiver-scan.outputs.WAIVER_ID || 'None' }}
+            COMPONENT_ID=${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+
+      - name: Define operation based on technology input
+        id: define-operation
+        uses: actions/github-script@v7.0.1
+        env:
+          TECHNOLOGY: ${{ inputs.technology }}
+        with:
+          script: |
+            let operation;
+            switch (process.env.TECHNOLOGY) {
+              case 'docker':
+                console.log('Operation selected: GET_TYPE_ARTIFACT_STORE_BY_ID to retrieve information from release manager.');
+                operation = 'GET_TYPE_ARTIFACT_STORE_BY_ID';
+                break;
+              default:
+                console.log('Using default operation GET_ARTIFACTS_STORE to retrieve information from release manager.');
+                operation = 'GET_ARTIFACTS_STORE';
+                break;
+            }
+            core.setOutput('operation', operation);
+
+      # - name: Push application to artifact stores
+      #   if: (success() || failure() && steps.get-waiver-scan.result == 'success') &&
+      #       (github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/feature/') || 
+      #        (github.event_name == 'pull_request' && inputs.deploy-target-enabled == 'true'))
+      #   id: 'push-scan'
+      #   uses: santander-group-shared-assets/gln-alm-push-application-composite-action@v2.0.0
+      #   with:
+      #     environment_type: ${{ inputs.environment_type }}
+      #     sts_url: ${{ fromJSON(inputs.env-vars-json).STS_LOGIN_URL }}
+      #     corporate_login_url: ${{ fromJSON(inputs.env-vars-json).CORPORATE_LOGIN_API_URL }}
+      #     corporate_username: ${{ secrets.CORPORATE_LOGIN_USER }}
+      #     corporate_password: ${{ secrets.CORPORATE_LOGIN_PASSWORD }}
+      #     management_url: ${{ fromJSON(inputs.env-vars-json).MANAGMENT_API_URL }}
+      #     repository: ${{ github.server_url }}/${{ github.repository }}
+      #     item: ${{ steps.tag.outputs.TAG_UUID }}
+      #     tag: ${{ env.TAG_VERSION }}
+      #     json_secrets: ${{ toJSON(secrets) }}
+      #     release_manager_url: ${{ fromJSON(inputs.env-vars-json).RELEASE_MANAGER_API_URL }}
+      #     vault_url: ${{ fromJSON(inputs.env-vars-json).VAULT_INSTANCE }}
+      #     operation: ${{ steps.define-operation.outputs.operation }}
+      #     component_id: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+      - name: Azure CLI Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Debug - Verify Azure context
+        run: |
+          echo "=== Azure Account Info ==="
+          az account show 2>&1 || echo "No subscription context available"
+          echo "=== ACR_DESTINATION variable ==="
+          echo "ACR_DESTINATION=${{ vars.ACR_DESTINATION }}"
+          echo "=== Checking if ACR_DESTINATION is empty ==="
+          if [ -z "${{ vars.ACR_DESTINATION }}" ]; then
+            echo "::error::ACR_DESTINATION variable is EMPTY or not configured!"
+            exit 1
+          fi
+      - name: ACR AAD token login (no admin user)
+        run: |
+          echo "ACR_NAME=${{ vars.ACR_DESTINATION }}"
+          echo "TAG_UUID=${{ steps.tag.outputs.TAG_UUID }}"
+          TOKEN=$(az acr login -n "${{ vars.ACR_DESTINATION }}" --expose-token --query accessToken -o tsv)
+          USER="00000000-0000-0000-0000-000000000000"
+          echo "$TOKEN" | docker login "${{ vars.ACR_DESTINATION }}.azurecr.io" -u "$USER" --password-stdin
+      - name: Push
+        run: |
+          docker push ${{ vars.ACR_DESTINATION }}.azurecr.io/${GITHUB_REPOSITORY}:${{ env.TAG_VERSION }}
+
+  send-data-to-elastic:
+    name: Send build-push ${{ inputs.environment_type }} to data search engine tool
+    needs: [container-build-and-push]
+    if: always() && !cancelled() && needs.container-build-and-push.result != 'skipped'
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        registries: ${{ fromJSON(needs.container-build-and-push.outputs.data-json) }}
+      fail-fast: false
+    steps:
+      - name: Send info to data search engine tool
+        uses: santander-group-shared-assets/gln-alm-data-search-engine-application-action@2.0.0
+        with:
+          component_id: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+          instance: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_API_URL }}
+          alias: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_ALIAS }}
+          type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_TYPE }}
+          auth-type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_AUTH_TYPE }}
+          token: ${{ secrets.ELASTICSEARCH_API_KEY_PRO }}
+          job-type: 'build-push'
+          parameters: >  
+            {
+              "IMAGE": "${{ matrix.registries.image || 'None' }}",
+              "IMAGE_URL": "${{ matrix.registries.image_url || 'None' }}",
+              "PUSH": "${{ matrix.registries.push || 'None' }}"
+            }
+
+  container-build-and-push-production:
+    name: Release container build and push application to production
+    needs: [container-build-and-push]
+    runs-on: ${{ inputs.runner }}
+    if: ${{ 'preproduction' == inputs.environment_type }}
+    environment: production
+    outputs:
+      tag-version: ${{ env.TAG_VERSION }}
+      data-json: ${{ steps.push-scan.outputs.data-json || '["None"]' }}
+    env:
+      MAVEN_OPTS: ${{ fromJSON(inputs.env-vars-json).MAVEN_OPTS }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git-ref }}
+          fetch-depth: 0
+      # Java_Maven technology
+      - name: Get JFrog access token
+        id: jfrog-token
+        uses: santander-group-shared-assets/gln-alm-jfrog-oidc-token-action@1.0.1
+        with:
+          url: ${{ vars.JFROG_PLATFORM_URL }}
+          audience: ${{ vars.JFROG_AUDIENCE }}
+          provider_name: ${{ vars.JFROG_PROVIDER_NAME }}
+      - name: Setup Java/Maven tools
+        if: ${{ inputs.technology == 'Java_Maven' }}
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.1.0
+        with:
+          tools_and_versions: >
+            java:${{ fromJSON(inputs.env-vars-json).JAVA_VERSION }},
+            maven:${{ fromJSON(inputs.env-vars-json).MAVEN_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+          maven_settings: ${{ vars.MAVEN_SETTINGS_TEMPLATE || vars.MAVEN_SETTINGS_URL || fromJSON(inputs.env-vars-json).MAVEN_SETTINGS_URL }}
+      - name: Generate artifact files with maven
+        if: ${{ inputs.technology == 'Java_Maven' }}
+        shell: bash
+        run: |
+          artifact_native_compilation=${{ fromJSON(inputs.env-vars-json).ARTIFACT_NATIVE_COMPILATION }}
+          if [[ $artifact_native_compilation == true ]]; then
+            mvn native:compile -Pnative -Dmaven.test.skip=true
+          else
+            mvn clean package -Dmaven.test.skip=true
+          fi
+      # Npm technology
+      - name: Setup NodeJs tools
+        if: ${{ inputs.technology == 'npm' && fromJSON(inputs.env-vars-json).NODE_VERSION != '' }}
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.2.0
+        with:
+          tools_and_versions: >
+            nodejs:${{ fromJSON(inputs.env-vars-json).NODE_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+          npm_settings: ${{ vars.NPM_SETTINGS_TEMPLATE || vars.NPM_SETTINGS_URL || fromJSON(inputs.env-vars-json).NPM_SETTINGS_URL }}
+
+      - name: Apply NPM settings template to project
+        if: ${{ vars.NPM_SETTINGS_TEMPLATE && hashFiles('.npmrc') != '' }}
+        env:
+          NPM_SETTINGS: ${{ vars.NPM_SETTINGS_TEMPLATE }}
+        run: |
+          echo "Merging NPM settings template into project .npmrc..."
+          
+          # Backup existing .npmrc
+          [ "${DEBUG:-false}" = "true" ] && echo "DEBUG: Backing up existing .npmrc"
+          cp .npmrc .npmrc.backup
+          
+          if [ "${DEBUG:-false}" = "true" ]; then
+            echo "DEBUG: Template content:"
+            echo "$NPM_SETTINGS"
+            echo "DEBUG: ---"
+          fi
+          
+          # Process template and merge with existing .npmrc
+          echo "$NPM_SETTINGS" | while IFS='=' read -r key value; do
+            # Skip empty lines and comments
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            
+            [ "${DEBUG:-false}" = "true" ] && echo "DEBUG: Processing key='$key' value='$value'"
+            
+            # Replace all environment variables with format ${env.VARIABLE}
+            while [[ "$value" =~ \$\{env\.([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+              var_name="${BASH_REMATCH[1]}"
+              var_value="${!var_name}"
+              [ "${DEBUG:-false}" = "true" ] && echo "DEBUG: Replacing \${env.${var_name}} with '$var_value'"
+              value="${value//\$\{env.${var_name}\}/$var_value}"
+            done
+            
+            key=$(echo "$key" | xargs)
+            
+            [ "${DEBUG:-false}" = "true" ] && echo "DEBUG: Final key='$key' value='$value'"
+            
+            # Update or add the configuration
+            if grep -q "^${key}[[:space:]]*=" .npmrc; then
+              [ "${DEBUG:-false}" = "true" ] && echo "Updating $key in .npmrc"
+              sed -i "s|^${key}[[:space:]]*=.*|${key}=${value}|" .npmrc
+            else
+              [ "${DEBUG:-false}" = "true" ] && echo "Adding $key to .npmrc"
+              echo "${key}=${value}" >> .npmrc
+            fi
+          done
+          
+          if [ "${DEBUG:-false}" = "true" ]; then
+            echo "=== Project .npmrc ==="
+            cat .npmrc
+            echo "======================"
+
+            echo "=== npm config list ==="
+            npm config list
+          fi
+     
+      - name: Prepare artifact files with npm
+        if: ${{ inputs.technology == 'npm' }}
+        shell: bash
+        run: |
+          # Project info:
+          PACKAGE_PATH='./'
+          PATH_TO_FILE="${{ fromJSON(inputs.env-vars-json).NPM_LIBRARY_DIRECTORY }}"
+          if [ ! -f "$PATH_TO_FILE" ]; then
+            PACKAGE_PATH=$PATH_TO_FILE/
+          fi
+          application_name="$(jq -r '.name' $PACKAGE_PATH""package.json)"
+          if [[ "$application_name" == "@"* && "$application_name" == *"/"* ]]; then
+            # sets the name and group from name
+            application_name=$(echo $application_name | sed 's:.*/::')
+          fi
+          version="$(jq -r '.version' $PACKAGE_PATH""package.json)"
+          ARTIFACT_PATH=./$application_name-$version.zip
+          CONFIG_PATH=./$application_name-$version-config.zip
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+          echo "CONFIG_PATH=$CONFIG_PATH" >> $GITHUB_ENV
+
+          # Run npm install and build
+          ${{ fromJSON(inputs.env-vars-json).NPM_RUN_INSTALL_COMMAND }} && ${{ fromJSON(inputs.env-vars-json).NPM_RUN_BUILD_COMMAND }}
+      - name: Generate Npm Artifact Zip
+        if: ${{ inputs.technology == 'npm' }}
+        run: |
+          cd ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_DIRECTORY }}
+          zip -r ${GITHUB_WORKSPACE}/${{env.ARTIFACT_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_CONTENT }}
+      - name: Generate Npm Config Zip
+        if: ${{ inputs.technology == 'npm' }}
+        run: |
+          if [[ -d "${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_DIRECTORY }}" ]]; then
+            zip -r ${GITHUB_WORKSPACE}/${{env.CONFIG_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_DIRECTORY }}/${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_CONTENT }}
+          else
+            echo "Configuration directory not found"
+          fi
+      # Python technology
+      - name: Setup Python tools
+        if: inputs.technology == 'python'
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.1.0
+        with:
+          tools_and_versions: >
+            python:${{ fromJSON(inputs.env-vars-json).PYTHON_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+      - name: Generate artifact files with Python
+        if: inputs.technology == 'python'
+        shell: bash {0}
+        run: |
+          echo "::debug::PYTHON_BUILD_COMMAND:${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}"
+          echo "::debug::PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}"
+          echo "::debug::PIP_COMPONENTS_INSTALL_COMMAND:${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}"
+          echo "::debug::PYTHON_REQUIREMENTS_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}"
+          echo "::debug::PYTHON_TEST_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_DIRECTORY }}"
+          echo "::debug::PYTHON_SKIP_TEST:${{ fromJSON(inputs.env-vars-json).PYTHON_SKIP_TEST }}"
+          echo "::debug::PYTHON_TEST_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_PATH }}"
+          ${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}
+          python -m venv ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}
+          . ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}/bin/activate
+          python -m pip install --upgrade pip
+          ${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}
+          pip install -v -r ${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}
+          if [[ -d "${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_DIRECTORY }}" ]]; then
+            if [[ "${{ fromJSON(inputs.env-vars-json).PYTHON_SKIP_TEST }}" == "false" ]]; then
+              export LC_ALL=C.UTF-8
+              export LANG=C.UTF-8
+              pip install pytest pytest-cov
+              python -m pytest --verbose --junit-xml ${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_PATH }} --cov-report=xml --cov
+            fi
+          fi
+      - name: Get project version
+        if: inputs.technology == 'python'
+        id: python-project-version
+        uses: santander-group-shared-assets/gln-alm-version-manager-action@v1.14.0
+        with:
+          version_file: 'setup.py'
+      - name: Generate Python Artifact Zip
+        if: ${{ inputs.technology == 'python' }}
+        shell: bash {0}
+        run: |
+          # cd ${{ fromJSON(inputs.env-vars-json).PYTHON_DIST_DIRECTORY }}
+          # zip -r ${GITHUB_WORKSPACE}/${{env.ARTIFACT_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_CONTENT }}
+          project_name=$(python setup.py --name)
+          ARTIFACT_PATH=dist/$project_name-${{ steps.python-project-version.outputs.version }}.tar.gz
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH"
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+  
+      - name: Setting tag version
+        id: tag
+        # Add a logic to update the version when is a main branch and set the new version to the TAG_VERSION variable
+        run: |
+          if [ -n "${{ inputs.tag-version }}" ]; then
+            tag="${{ inputs.tag-version }}"
+          else
+            tag="${GITHUB_REF##*/}"
+          fi
+          taguuid=`uuidgen`
+          echo "TAG_UUID=${taguuid}" >> $GITHUB_OUTPUT
+          echo "TAG_VERSION=$tag" >> $GITHUB_ENV
+
+      - name: Container tool build
+        id: 'build'
+        run: |
+          artifact_native_compilation=${{ fromJSON(inputs.env-vars-json).ARTIFACT_NATIVE_COMPILATION }}
+          if [[ $artifact_native_compilation == true ]]; then
+            file_name="Dockerfile.native"
+          else
+            file_name="Dockerfile"
+          fi
+          buildah bud \
+            --file $file_name \
+            --format docker \
+            --no-cache ${{ fromJSON(inputs.env-vars-json).CONTAINER_BUILD_ARGUMENTS || fromJSON(inputs.env-vars-json).DOCKER_BUILD_ARGUMENTS }} \
+            --label "github-commit-hash=${GITHUB_SHA}" \
+            --label "github-repository=${GITHUB_REPOSITORY}" \
+            --tag ${{ vars.ACR_DESTINATION }}.azurecr.io/${GITHUB_REPOSITORY}:${{ env.TAG_VERSION }} .
+
+      - name: Define operation based on technology input
+        id: define-operation
+        uses: actions/github-script@v7.0.1
+        env:
+          TECHNOLOGY: ${{ inputs.technology }}
+        with:
+          script: |
+            let operation;
+            switch (process.env.TECHNOLOGY) {
+              case 'docker':
+                console.log('Operation selected: GET_TYPE_ARTIFACT_STORE_BY_ID to retrieve information from release manager.');
+                operation = 'GET_TYPE_ARTIFACT_STORE_BY_ID';
+                break;
+              default:
+                console.log('Using default operation GET_ARTIFACTS_STORE to retrieve information from release manager.');
+                operation = 'GET_ARTIFACTS_STORE';
+                break;
+            }
+            core.setOutput('operation', operation);
+
+      # - name: Push application to artifact stores
+      #   id: 'push-scan'
+      #   uses: santander-group-shared-assets/gln-alm-push-application-composite-action@v2.0.0
+      #   with:
+      #     environment_type: production
+      #     sts_url: ${{ fromJSON(inputs.env-vars-json).STS_LOGIN_URL }}
+      #     corporate_login_url: ${{ fromJSON(inputs.env-vars-json).CORPORATE_LOGIN_API_URL }}
+      #     corporate_username: ${{ secrets.CORPORATE_LOGIN_USER }}
+      #     corporate_password: ${{ secrets.CORPORATE_LOGIN_PASSWORD }}
+      #     management_url: ${{ fromJSON(inputs.env-vars-json).MANAGMENT_API_URL }}
+      #     repository: ${{ github.server_url }}/${{ github.repository }}
+      #     item: ${{ steps.tag.outputs.TAG_UUID }}
+      #     tag: ${{ env.TAG_VERSION }}
+      #     json_secrets: ${{ toJSON(secrets) }}
+      #     release_manager_url: ${{ fromJSON(inputs.env-vars-json).RELEASE_MANAGER_API_URL }}
+      #     vault_url: ${{ fromJSON(inputs.env-vars-json).VAULT_INSTANCE }}
+      #     operation: ${{ steps.define-operation.outputs.operation }}
+      #     component_id: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+
+      - name: Azure CLI Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Debug - Verify Azure context
+        run: |
+          echo "=== Azure Account Info ==="
+          az account show 2>&1 || echo "No subscription context available"
+          echo "=== ACR_DESTINATION variable ==="
+          echo "ACR_DESTINATION=${{ vars.ACR_DESTINATION }}"
+          echo "=== Checking if ACR_DESTINATION is empty ==="
+          if [ -z "${{ vars.ACR_DESTINATION }}" ]; then
+            echo "::error::ACR_DESTINATION variable is EMPTY or not configured!"
+            exit 1
+          fi
+      - name: ACR AAD token login (no admin user)
+        run: |
+          echo "ACR_NAME=${{ vars.ACR_DESTINATION }}"
+          echo "TAG_UUID=${{ steps.tag.outputs.TAG_UUID }}"
+          TOKEN=$(az acr login -n "${{ vars.ACR_DESTINATION }}" --expose-token --query accessToken -o tsv)
+          USER="00000000-0000-0000-0000-000000000000"
+          echo "$TOKEN" | docker login "${{ vars.ACR_DESTINATION }}.azurecr.io" -u "$USER" --password-stdin
+      - name: Push
+        run: |
+          docker push ${{ vars.ACR_DESTINATION }}.azurecr.io/${GITHUB_REPOSITORY}:${{ env.TAG_VERSION }}
+
+  send-data-to-elastic-production:
+    name: Send build-push production data to data search engine tool
+    needs: [container-build-and-push-production]
+    if: always() && !cancelled() && 'preproduction' == inputs.environment_type &&
+      needs.container-build-and-push-production.result != 'skipped'
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        registries: ${{ fromJSON(needs.container-build-and-push-production.outputs.data-json) }}
+      fail-fast: false
+    steps:
+      - name: Send info to data search engine tool
+        uses: santander-group-shared-assets/gln-alm-data-search-engine-application-action@2.0.0
+        with:
+          component_id: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+          instance: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_API_URL }}
+          alias: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_ALIAS }}
+          type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_TYPE }}
+          auth-type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_AUTH_TYPE }}
+          token: ${{ secrets.ELASTICSEARCH_API_KEY_PRO }}
+          job-type: 'build-push'
+          parameters: >
+            {
+              "IMAGE":"${{ matrix.registries.image || 'None' }}",
+              "IMAGE_URL":"${{ matrix.registries.image_url || 'None' }}",
+              "PUSH":"${{ matrix.registries.push || 'None' }}"
+            }
+
+  container-build-and-push-certification:
+    name: Release container build and push application to certification
+    needs: [container-build-and-push]
+    if: ${{ 'preproduction' == inputs.environment_type }}
+    runs-on: ${{ inputs.runner }}
+    environment: certification   
+    outputs:
+      tag-version: ${{ env.TAG_VERSION }}
+      data-json: ${{ steps.push-scan.outputs.data-json || '["None"]' }}
+    env:
+      MAVEN_OPTS: ${{ fromJSON(inputs.env-vars-json).MAVEN_OPTS }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git-ref }}
+          fetch-depth: 0
+      - name: Get JFrog access token
+        id: jfrog-token
+        uses: santander-group-shared-assets/gln-alm-jfrog-oidc-token-action@1.0.1
+        with:
+          url: ${{ vars.JFROG_PLATFORM_URL }}
+          audience: ${{ vars.JFROG_AUDIENCE }}
+          provider_name: ${{ vars.JFROG_PROVIDER_NAME }}
+      # Java_Maven technology
+      - name: Setup Java/Maven tools
+        if: ${{ inputs.technology == 'Java_Maven' }}
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.1.0
+        with:
+          tools_and_versions: >
+            java:${{ fromJSON(inputs.env-vars-json).JAVA_VERSION }},
+            maven:${{ fromJSON(inputs.env-vars-json).MAVEN_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+          maven_settings: ${{ vars.MAVEN_SETTINGS_TEMPLATE || vars.MAVEN_SETTINGS_URL || fromJSON(inputs.env-vars-json).MAVEN_SETTINGS_URL }}
+      - name: Generate artifact files with maven
+        if: ${{ inputs.technology == 'Java_Maven' }}
+        shell: bash
+        run: |
+          artifact_native_compilation=${{ fromJSON(inputs.env-vars-json).ARTIFACT_NATIVE_COMPILATION }}
+          if [[ $artifact_native_compilation == true ]]; then
+            mvn native:compile -Pnative -Dmaven.test.skip=true
+          else
+            mvn clean package -Dmaven.test.skip=true
+          fi
+      # Npm technology
+      - name: Setup NodeJs tools
+        if: ${{ inputs.technology == 'npm' && fromJSON(inputs.env-vars-json).NODE_VERSION != '' }}
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.2.0
+        with:
+          tools_and_versions: >
+            nodejs:${{ fromJSON(inputs.env-vars-json).NODE_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+          npm_settings: ${{ vars.NPM_SETTINGS_TEMPLATE || vars.NPM_SETTINGS_URL || fromJSON(inputs.env-vars-json).NPM_SETTINGS_URL }}
+      - name: Prepare artifact files with npm
+        if: ${{ inputs.technology == 'npm' }}
+        shell: bash
+        run: |
+          # Project info:
+          PACKAGE_PATH='./'
+          PATH_TO_FILE="${{ fromJSON(inputs.env-vars-json).NPM_LIBRARY_DIRECTORY }}"
+          if [ ! -f "$PATH_TO_FILE" ]; then
+            PACKAGE_PATH=$PATH_TO_FILE/
+          fi
+          application_name="$(jq -r '.name' $PACKAGE_PATH""package.json)"
+          if [[ "$application_name" == "@"* && "$application_name" == *"/"* ]]; then
+            # sets the name and group from name
+            application_name=$(echo $application_name | sed 's:.*/::')
+          fi
+          version="$(jq -r '.version' $PACKAGE_PATH""package.json)"
+          ARTIFACT_PATH=./$application_name-$version.zip
+          CONFIG_PATH=./$application_name-$version-config.zip
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+          echo "CONFIG_PATH=$CONFIG_PATH" >> $GITHUB_ENV
+
+          # Run npm install and build
+          ${{ fromJSON(inputs.env-vars-json).NPM_RUN_INSTALL_COMMAND }} && ${{ fromJSON(inputs.env-vars-json).NPM_RUN_BUILD_COMMAND }}
+      - name: Generate Npm Artifact Zip
+        if: ${{ inputs.technology == 'npm' }}
+        run: |
+          cd ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_DIRECTORY }}
+          zip -r ${GITHUB_WORKSPACE}/${{env.ARTIFACT_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_CONTENT }}
+      - name: Generate Npm Config Zip
+        if: ${{ inputs.technology == 'npm' }}
+        run: |
+          if [[ -d "${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_DIRECTORY }}" ]]; then
+            zip -r ${GITHUB_WORKSPACE}/${{env.CONFIG_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_DIRECTORY }}/${{ fromJSON(inputs.env-vars-json).NPM_CONFIGURATION_DIST_CONTENT }}
+          else
+            echo "Configuration directory not found"
+          fi
+      # Python technology
+      - name: Setup Python tools
+        if: inputs.technology == 'python'
+        uses: santander-group-shared-assets/gln-setup-runner-ohe-action@2.1.0
+        with:
+          tools_and_versions: >
+            python:${{ fromJSON(inputs.env-vars-json).PYTHON_VERSION }},
+            gcloud:${{ fromJSON(inputs.env-vars-json).GCLOUD_VERSION }}
+      - name: Generate artifact files with Python
+        if: inputs.technology == 'python'
+        shell: bash {0}
+        run: |
+          echo "::debug::PYTHON_BUILD_COMMAND:${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}"
+          echo "::debug::PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}"
+          echo "::debug::PIP_COMPONENTS_INSTALL_COMMAND:${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}"
+          echo "::debug::PYTHON_REQUIREMENTS_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}"
+          echo "::debug::PYTHON_TEST_DIRECTORY:${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_DIRECTORY }}"
+          echo "::debug::PYTHON_SKIP_TEST:${{ fromJSON(inputs.env-vars-json).PYTHON_SKIP_TEST }}"
+          echo "::debug::PYTHON_TEST_PATH:${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_PATH }}"
+          ${{ fromJSON(inputs.env-vars-json).PYTHON_BUILD_COMMAND }}
+          python -m venv ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}
+          . ${{ fromJSON(inputs.env-vars-json).PYTHON_VIRTUAL_ENVIRONMENT_DIRECTORY }}/bin/activate
+          python -m pip install --upgrade pip
+          ${{ fromJSON(inputs.env-vars-json).PIP_COMPONENTS_INSTALL_COMMAND }}
+          pip install -v -r ${{ fromJSON(inputs.env-vars-json).PYTHON_REQUIREMENTS_PATH }}
+          if [[ -d "${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_DIRECTORY }}" ]]; then
+            if [[ "${{ fromJSON(inputs.env-vars-json).PYTHON_SKIP_TEST }}" == "false" ]]; then
+              export LC_ALL=C.UTF-8
+              export LANG=C.UTF-8
+              pip install pytest pytest-cov
+              python -m pytest --verbose --junit-xml ${{ fromJSON(inputs.env-vars-json).PYTHON_TEST_PATH }} --cov-report=xml --cov
+            fi
+          fi
+      - name: Get project version
+        if: inputs.technology == 'python'
+        id: python-project-version
+        uses: santander-group-shared-assets/gln-alm-version-manager-action@v1.14.0
+        with:
+          version_file: 'setup.py'
+      - name: Generate Python Artifact Zip
+        if: ${{ inputs.technology == 'python' }}
+        shell: bash {0}
+        run: |
+          # cd ${{ fromJSON(inputs.env-vars-json).PYTHON_DIST_DIRECTORY }}
+          # zip -r ${GITHUB_WORKSPACE}/${{env.ARTIFACT_PATH}} ${{ fromJSON(inputs.env-vars-json).NPM_APPLICATION_DIST_CONTENT }}
+          project_name=$(python setup.py --name)
+          ARTIFACT_PATH=dist/$project_name-${{ steps.python-project-version.outputs.version }}.tar.gz
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH"
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+  
+      - name: Setting tag version
+        id: tag
+        # Add a logic to update the version when is a main branch and set the new version to the TAG_VERSION variable
+        run: |
+          if [ -n "${{ inputs.tag-version }}" ]; then
+            tag="${{ inputs.tag-version }}"
+          else
+            tag="${GITHUB_REF##*/}"
+          fi
+          taguuid=`uuidgen`
+          echo "TAG_UUID=${taguuid}" >> $GITHUB_OUTPUT
+          echo "TAG_VERSION=$tag" >> $GITHUB_ENV
+
+      - name: Container tool build
+        id: 'build'
+        run: |
+          artifact_native_compilation=${{ fromJSON(inputs.env-vars-json).ARTIFACT_NATIVE_COMPILATION }}
+          if [[ $artifact_native_compilation == true ]]; then
+            file_name="Dockerfile.native"
+          else
+            file_name="Dockerfile"
+          fi
+          buildah bud \
+            --file $file_name \
+            --format docker \
+            --no-cache ${{ fromJSON(inputs.env-vars-json).CONTAINER_BUILD_ARGUMENTS || fromJSON(inputs.env-vars-json).DOCKER_BUILD_ARGUMENTS }} \
+            --label "github-commit-hash=${GITHUB_SHA}" \
+            --label "github-repository=${GITHUB_REPOSITORY}" \
+            --tag ${{ vars.ACR_DESTINATION }}.azurecr.io/${GITHUB_REPOSITORY}:${{ env.TAG_VERSION }} .
+
+      - name: Define operation based on technology input
+        id: define-operation
+        uses: actions/github-script@v7.0.1
+        env:
+          TECHNOLOGY: ${{ inputs.technology }}
+        with:
+          script: |
+            let operation;
+            switch (process.env.TECHNOLOGY) {
+              case 'docker':
+                console.log('Operation selected: GET_TYPE_ARTIFACT_STORE_BY_ID to retrieve information from release manager.');
+                operation = 'GET_TYPE_ARTIFACT_STORE_BY_ID';
+                break;
+              default:
+                console.log('Using default operation GET_ARTIFACTS_STORE to retrieve information from release manager.');
+                operation = 'GET_ARTIFACTS_STORE';
+                break;
+            }
+            core.setOutput('operation', operation);
+    
+      # - name: Push application to artifact stores
+      #   id: 'push-scan'
+      #   uses: santander-group-shared-assets/gln-alm-push-application-composite-action@v2.0.0
+      #   with:
+      #     environment_type: certification
+      #     sts_url: ${{ fromJSON(inputs.env-vars-json).STS_LOGIN_URL }}
+      #     corporate_login_url: ${{ fromJSON(inputs.env-vars-json).CORPORATE_LOGIN_API_URL }}
+      #     corporate_username: ${{ secrets.CORPORATE_LOGIN_USER }}
+      #     corporate_password: ${{ secrets.CORPORATE_LOGIN_PASSWORD }}
+      #     management_url: ${{ fromJSON(inputs.env-vars-json).MANAGMENT_API_URL }}
+      #     repository: ${{ github.server_url }}/${{ github.repository }}
+      #     item: ${{ steps.tag.outputs.TAG_UUID }}
+      #     tag: ${{ env.TAG_VERSION }}
+      #     json_secrets: ${{ toJSON(secrets) }}
+      #     release_manager_url: ${{ fromJSON(inputs.env-vars-json).RELEASE_MANAGER_API_URL }}
+      #     vault_url: ${{ fromJSON(inputs.env-vars-json).VAULT_INSTANCE }}
+      #     operation: ${{ steps.define-operation.outputs.operation }}
+      #     component_id: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+      # - name: Azure CLI Login
+      #   uses: azure/login@v2
+      #   with:
+      #     client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_MI }}
+      - name: Azure CLI Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Debug - Verify Azure context
+        run: |
+          echo "=== Azure Account Info ==="
+          az account show 2>&1 || echo "No subscription context available"
+          echo "=== ACR_DESTINATION variable ==="
+          echo "ACR_DESTINATION=${{ vars.ACR_DESTINATION }}"
+          echo "=== Checking if ACR_DESTINATION is empty ==="
+          if [ -z "${{ vars.ACR_DESTINATION }}" ]; then
+            echo "::error::ACR_DESTINATION variable is EMPTY or not configured!"
+            exit 1
+          fi
+      - name: ACR AAD token login (no admin user)
+        run: |
+          echo "ACR_NAME=${{ vars.ACR_DESTINATION }}"
+          echo "TAG_UUID=${{ steps.tag.outputs.TAG_UUID }}"
+          TOKEN=$(az acr login -n "${{ vars.ACR_DESTINATION }}" --expose-token --query accessToken -o tsv)
+          USER="00000000-0000-0000-0000-000000000000"
+          echo "$TOKEN" | docker login "${{ vars.ACR_DESTINATION }}.azurecr.io" -u "$USER" --password-stdin
+      - name: Push
+        run: |
+          docker push ${{ vars.ACR_DESTINATION }}.azurecr.io/${GITHUB_REPOSITORY}:${{ env.TAG_VERSION }}
+
+
+  send-data-to-elastic-certification:
+    name: Send build-push certification data to data search engine tool
+    needs: [container-build-and-push-certification]
+    if: always() && !cancelled() && 'preproduction' == inputs.environment_type && needs.container-build-and-push-certification.result != 'skipped'
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        registries: ${{ fromJSON(needs.container-build-and-push-certification.outputs.data-json) }}
+      fail-fast: false
+    steps:
+      - name: Send info to data search engine tool
+        uses: santander-group-shared-assets/gln-alm-data-search-engine-application-action@2.0.0
+        with:
+          component_id: ${{ fromJSON(inputs.env-vars-json).COMPONENT_ID }}
+          instance: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_API_URL }}
+          alias: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_ALIAS }}
+          type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_TYPE }}
+          auth-type: ${{ fromJSON(inputs.env-vars-json).ELASTICSEARCH_AUTH_TYPE }}
+          token: ${{ secrets.ELASTICSEARCH_API_KEY_PRO }}
+          job-type: 'build-push'
+          parameters: >
+            {
+              "IMAGE": "${{ matrix.registries.image || 'None' }}",
+              "IMAGE_URL": "${{ matrix.registries.image_url || 'None' }}",
+              "PUSH": "${{ matrix.registries.push || 'None' }}"
+            }

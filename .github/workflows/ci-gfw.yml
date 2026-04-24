@@ -1,0 +1,17 @@
+name: Integration
+
+on:
+  push:
+    branches:
+      - development
+      - develop
+      - feature/*
+
+jobs:
+  call-reusable-workflow:
+    name: Integration
+    #uses: santander-group-shared-assets/gln-workflows/.github/workflows/npm-ci-gfw.yml@v1
+    uses: ./.github/workflows/npm-ci-gfw.yml
+    with:
+      technology: 'npm'
+    secrets: inherit

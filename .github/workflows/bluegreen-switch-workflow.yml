@@ -1,0 +1,26 @@
+name: Bluegreen Deployment Switch
+on:
+  workflow_dispatch:
+    inputs:
+      deployment-yaml-name:
+        required: false
+        type: string
+        default: 'deployment.yaml'
+        description: 'Name of yaml file that includes the deployment configuration for one or more environments.'
+      deployment-environment:
+        required: true
+        type: choice
+        options:
+          - cert
+          - pre
+          - pro
+        description: "Environment to deploy"
+
+jobs:
+  call-reusable-workflow:
+    name: Switch environment regions
+    uses: santander-group-shared-assets/gln-workflows/.github/workflows/bluegreen-switch-workflow.yml@v1
+    with:
+      environment: ${{ inputs.deployment-environment }}
+      deployment-yaml-file: ${{ inputs.deployment-yaml-name }}
+    secrets: inherit

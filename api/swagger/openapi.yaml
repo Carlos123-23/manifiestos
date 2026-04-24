@@ -1,0 +1,324 @@
+---
+# Swagger specification
+openapi: 3.0.2
+info:
+  version: 1.0.0
+  title: Fastify Clean Architecture
+  description: Clean architecture on Fastify example
+servers:
+  - url: /
+paths:
+  # health path to verify application status
+  /health/:
+    get:
+      tags:
+        - Health check
+      # response
+      responses:
+        200:
+          description: Successful request
+          content:
+            application/json:
+              # reference to response schema
+              schema:
+                $ref: '#/components/schemas/healthSuccess'
+  /api/find-by-identification:
+    post:
+      tags:
+        - Natural Person
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FindByIdentificationRequest'
+      responses:
+        200:
+          description: successful request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessNaturalPersonResponse'
+        400:
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
+        404:
+          description: customer not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
+        500:
+          description: internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
+        502:
+          description: external service failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
+# schemas definition
+components:
+  schemas:
+    FindByIdentificationRequest:
+      oneOf:
+        - type: object
+          properties:
+            identification:
+              type: object
+              properties:
+                number:
+                  type: string
+                type:
+                  oneOf:
+                    - type: string
+                    - type: object
+                      properties:
+                        code:
+                          type: string
+                      required:
+                        - code
+              required:
+                - number
+                - type
+          required:
+            - identification
+        - type: object
+          properties:
+            naturalPerson:
+              type: object
+              properties:
+                identification:
+                  type: object
+                  properties:
+                    number:
+                      type: string
+                    type:
+                      oneOf:
+                        - type: string
+                        - type: object
+                          properties:
+                            code:
+                              type: string
+                          required:
+                            - code
+                  required:
+                    - number
+                    - type
+              required:
+                - identification
+          required:
+            - naturalPerson
+    NaturalPersonResponse:
+      type: object
+      properties:
+        naturalPerson:
+          type: object
+          properties:
+            code:
+              type: string
+            identification:
+              type: object
+              properties:
+                number:
+                  type: string
+                type:
+                  type: object
+                  properties:
+                    code:
+                      type: string
+                dueDate:
+                  type: string
+            fullName:
+              type: string
+            name:
+              type: string
+            otherName:
+              type: string
+            lastName:
+              type: string
+            otherLastName:
+              type: string
+            status:
+              type: object
+              properties:
+                code:
+                  type: string
+            subsidiary:
+              type: object
+              properties:
+                code:
+                  type: number
+                description:
+                  type: string
+            branch:
+              type: object
+              properties:
+                code:
+                  type: number
+                description:
+                  type: string
+            enrollmentDate:
+              type: string
+            lastUpdateDate:
+              type: string
+            economicGroup:
+              type: object
+              properties:
+                code:
+                  type: number
+                description:
+                  type: string
+            officer:
+              type: object
+              properties:
+                code:
+                  type: number
+                description:
+                  type: string
+            retention:
+              type: boolean
+            sex:
+              type: object
+              properties:
+                code:
+                  type: string
+            gender:
+              type: object
+              properties:
+                code:
+                  type: string
+            birthDate:
+              type: string
+            profession:
+              type: object
+              properties:
+                code:
+                  type: string
+            maritalStatus:
+              type: object
+              properties:
+                code:
+                  type: string
+            dependants:
+              type: number
+            degreeLevel:
+              type: object
+              properties:
+                code:
+                  type: string
+            clientQuality:
+              type: object
+              properties:
+                code:
+                  type: string
+            relationship:
+              type: object
+              properties:
+                code:
+                  type: string
+            currentOperationsWithFinancialEntity:
+              type: boolean
+            externalCode:
+              type: string
+            countryBirth:
+              type: object
+              properties:
+                code:
+                  type: number
+                description:
+                  type: string
+            foreignerNaturalised:
+              type: boolean
+            imigration:
+              type: string
+            foreignIdentification:
+              type: object
+              properties:
+                number:
+                  type: string
+            originAddress:
+              type: object
+              properties:
+                number:
+                  type: string
+            homeTown:
+              type: string
+            heritageType:
+              type: object
+              properties:
+                code:
+                  type: string
+            heritageValue:
+              type: string
+            isSpouse:
+              type: boolean
+            spouseIdentification:
+              type: object
+              properties:
+                number:
+                  type: string
+      required:
+        - naturalPerson
+
+    StandardSuccessNaturalPersonResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        statusCode:
+          type: number
+          example: 200
+        data:
+          $ref: '#/components/schemas/NaturalPersonResponse'
+      required:
+        - success
+        - statusCode
+        - data
+
+    StandardErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        statusCode:
+          type: number
+          example: 400
+        error:
+          type: string
+          example: Bad Request
+        message:
+          type: string
+          example: Invalid request payload
+        detail:
+          type: object
+          additionalProperties: true
+      required:
+        - success
+        - statusCode
+        - error
+        - message
+    # health check schema response
+    healthSuccess:
+      type: object
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+        releaseId:
+          type: string
+        time:
+          type: string
+        description:
+          type: string
+...
+# end of file

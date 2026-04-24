@@ -1,0 +1,367 @@
+# https://registry.global.ccc.srvb.bo.paas.cloudcenter.corp/harbor/projects/1670/helm-charts/darwin-nodejs-chart/versions/1.0.0
+# Default values for nodejs-chart.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Default values for darwin micro-nodejs chart.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+## Active
+active: online
+
+##########################
+# Labels and Annotations #
+##########################
+## @param commonLabels [object] Labels to add to all deployed objects
+##
+commonLabels: {}
+
+## @param commonAnnotations [object] Annotations to add to all deployed objects
+##
+commonAnnotations: {}
+
+## @param podLabels [object] Extra labels for the micro service pods
+## Ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+##
+podLabels: {}
+
+## @param podAnnotations [object] Annotations for the micro service pods
+## ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/
+##
+podAnnotations: {}
+
+
+## Darwin Micro Service image version
+## @param image.registry darwin micro image registry
+## @param image.repository darwin micro image name
+## @param image.tag darwin micro image tag
+## @param image.digest darwin micro image digest in the way sha256:aa.... Please note this parameter, if set, will override the tag
+##
+image:
+  ## @param image.registry micro image registry
+  repository: ${PROJECT}/${APPLICATION_NAME}
+  ## @param image.repository micro image name
+  # With ${REGISTRY} placeholder this will be replaced by the registry value of
+  # cluster properties block for each region
+  registry: ${REGISTRY}
+  ## @param image.tag micro image tag
+  ## Use ${TAG_VERSION} for the value will use the same version of pom.xml.
+  tag: ${TAG_VERSION}
+  digest: ""
+  ## @param image.pullPolicy darwin micro image pull policy
+  ## Specify a imagePullPolicy
+  ## Defaults to 'Always' if image tag is 'latest', else set to 'IfNotPresent'
+  ## ref: https://kubernetes.io/docs/user-guide/images/#pre-pulling-images
+  ##
+  pullPolicy: IfNotPresent
+
+## @param replicaCount Number of replicas of the micro service pod
+##
+replicaCount: 1
+
+## @param lifecycle [object] Override default micro service container hooks
+## If you do not set this property, the default hook is:  `{lifecycle: {preStop: {exec: {command: [sleep 120]}}}}`
+##
+lifecycle: {}
+
+## @param terminationGracePeriodSeconds In seconds, time the given to the pod needs to terminate gracefully
+## ref: https://kubernetes.io/docs/concepts/workloads/pods/pod/#termination-of-pods
+##
+terminationGracePeriodSeconds: 300
+
+## Darwin Micro Service pods' Security Context
+## ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod
+## @param podSecurityContext.enabled Enable security context for the pods
+## @param podSecurityContext.fsGroup Set Darwin Micro Service pod's Security Context fsGroup
+## e.g:
+##   podSecurityContext:
+##     enabled: true
+##     fsGroup: 1001
+##
+podSecurityContext:
+    enabled: true
+    runAsNonRoot: true
+    runAsUser: 23550
+    seccompProfile:
+        type: RuntimeDefault
+
+## Darwin Micro Service containers' Security Context
+## ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container
+## @param containerSecurityContext.enabled Enable Darwin Micro Service containers' Security Context
+## @param containerSecurityContext.runAsUser Set Darwin Micro Service containers' Security Context runAsUser
+## @param containerSecurityContext.runAsNonRoot Set Darwin Micro Service containers' Security Context runAsNonRoot
+## @param containerSecurityContext.allowPrivilegeEscalation Force the child process to be run as nonprivilege
+## e.g:
+##   containerSecurityContext:
+##     enabled: true
+##     runAsUser: 1001
+##     runAsNonRoot: true
+##     allowPrivilegeEscalation: false
+##
+containerSecurityContext:
+    enabled: true
+    runAsNonRoot: true
+    runAsUser: 23550
+    seccompProfile:
+        type: RuntimeDefault
+    allowPrivilegeEscalation: false
+    capabilities:
+        drop:
+            - ALL
+
+## @param podNodeSelector.enabled Enable node selection for the pods
+## @param podNodeSelector.{labelName1} Node label name1 and value1
+## @param podNodeSelector.{labelName2} Node label name2 and value2
+## e.g:
+##   podNodeSelector:
+##     enabled: true
+##     label1: value1
+##     label2: value2
+##     label3: value3
+##
+podNodeSelector:
+  enabled: false
+
+## Configures the ports microservice listens on
+## @param containerPorts.http Sets http port inside container
+## @param containerPorts.https Sets https port inside container
+##
+containerPorts:
+  http: 8080
+  https: 8443
+
+
+## @param extraContainerPorts Array of additional container ports for the container
+## e.g:
+## extraContainerPorts:
+##   - name: grpc
+##     containerPort: 4317
+##
+extraContainerPorts: []
+
+## darwin microservices containers resource requests and limits
+## ref: https://kubernetes.io/docs/user-guide/compute-resources/
+## @param resources.limits [object] The resources limits for the etcd container
+## @param resources.requests [object] The requested resources for the etcd container
+##
+resources:
+  ## Example:
+  ## limits:
+  ##    cpu: 500m
+  ##    memory: 1Gi
+  ##
+  limits:
+    memory: 1G
+    cpu: 500m
+  requests:
+    memory: 512M
+    cpu: 100m
+
+## @param updateStrategy.rollingUpdate deployment rolling update configuration parameters
+## ref: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
+## Note: Set to Recreate if you use persistent volume that cannot be mounted by more than one pods to make sure the pods is destroyed first.
+## E.g:
+## updateStrategy:
+##  type: RollingUpdate
+##  rollingUpdate:
+##    maxSurge: 25%
+##    maxUnavailable: 25%
+##
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate: {}
+
+## Configure extra options for liveness probe
+## ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#configure-probes
+## @param livenessProbe.enabled Enable livenessProbe by default /health
+## @param livenessProbe.initialDelaySeconds Initial delay seconds for livenessProbe
+## @param livenessProbe.periodSeconds Period seconds for livenessProbe
+## @param livenessProbe.timeoutSeconds Timeout seconds for livenessProbe
+## @param livenessProbe.failureThreshold Failure threshold for livenessProbe
+## @param livenessProbe.successThreshold Success threshold for livenessProbe
+##
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  timeoutSeconds: 1
+  periodSeconds: 10
+  successThreshold: 1
+  failureThreshold: 3
+
+
+## Configure extra options for readiness probe
+## ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#configure-probes
+## @param readinessProbe.enabled Enable readinessProbe, by default /health
+## @param readinessProbe.initialDelaySeconds Initial delay seconds for readinessProbe
+## @param readinessProbe.periodSeconds Period seconds for readinessProbe
+## @param readinessProbe.timeoutSeconds Timeout seconds for readinessProbe
+## @param readinessProbe.failureThreshold Failure threshold for readinessProbe
+## @param readinessProbe.successThreshold Success threshold for readinessProbe
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 10
+  timeoutSeconds: 1
+  periodSeconds: 10
+  successThreshold: 1
+  failureThreshold: 3
+
+
+## @param customLivenessProbe [object] Override default liveness probe
+##
+customLivenessProbe: {}
+
+## @param customReadinessProbe [object] Override default readiness probe
+##
+customReadinessProbe: {}
+
+## @param controller.initContainers Add additional init containers to the Controller pods
+## ref: https://kubernetes.io/docs/concepts/workloads/pods/init-containers/
+## E.g:
+## initContainers:
+##   - name: your-image-name
+##     image: your-image
+##     imagePullPolicy: Always
+##     ports:
+##       - name: portname
+##         containerPort: 1234
+##
+initContainers: []
+
+######################
+# Service parameters #
+######################
+service:
+  ## @param service.type Kubernetes service type
+  type: ClusterIP
+  ## @param service.overrideServiceName Override the default service name
+  overrideServiceName: 
+  ## @param service.ports.http Service HTTP port
+  ## @param service.ports.https Service HTTPS port
+  ##
+  ports:
+    http: 8080
+    https: 8443
+  targetPort:
+    http: 8080
+    https: 8443
+  ## @param service.annotations [object] Additional annotations for the service of the micro
+  ##
+  annotations: {}
+
+## TLS configuration
+##
+ssl:
+  ## @param ssl.enabled Enable init container that generate the truststore and keystore
+  ##
+  enabled: false
+
+#########################
+# Environment variables #
+#########################
+
+## @param extraEnvVars Extra environment variables to be set on Node container
+## For example:
+##  - name: BEARER_AUTH
+##    value: true
+##  - name: DARWIN_CM_KEY
+##    valueFrom:
+##      configMapKeyRef:
+##        name: "cm4"
+##        key: LOGGING_ROOT_LEVEL
+##        optional: false
+##  - name: DARWIN_SECRET_KEY
+##    valueFrom:
+##      secretKeyRef:
+##        name: "datagrid-app"
+##        key: "application-password"
+##        optional: false
+##
+extraEnvVars: []
+
+## @param extraEnvVarsCM Name of existing ConfigMap containing extra environment variables
+##
+extraEnvVarsCM:
+
+## @param extraEnvVarsSecret Name of existing Secret containing extra environment variables
+##
+extraEnvVarsSecret:
+
+## @section Volumes ##
+
+## @param extraVolumes Optionally specify extra list of additional volumes for the container(s)
+extraVolumes: []
+
+## @param extraVolumeMounts Optionally specify extra list of additional volumeMounts for the container(s)
+extraVolumeMounts: []
+
+## @section Darwin configuration
+
+## Darwin Framework parameters
+##
+darwin:
+  ## @param darwin.version. Darwin Nodejs Framework Version.
+  ## Examples values: `3.0.4`, `2.1.0`
+  version: "4.1.2"
+  ## @param darwin.gitRepo. Git repository with the source code of the microservice.
+  ## Example value: `https://github.alm.europe.cloudcenter.corp/sanes-darwin-poc/poc-certificates.git`
+  gitRepo: "https://github.alm.europe.cloudcenter.corp/sanes-darwin-poc/poc-certificates.git"
+  ## @param darwin.technologyVersion. Nodejs version of the image.
+  ## Possible values: `16`, `18`
+  technologyVersion: 18
+  ## @param darwin.region. Cluster identifier.
+  ## Possible values: `""`, `bo1`, `bo2`, `weu1.az` or `weu2.az`
+  region: ""
+  ## @param darwin.sufix. Suffix to blue green deployments.
+  ## Possible values: `""`, `-b` or `-g`
+  suffix: ""
+  logging_level_root: info
+  tz: Europe/Madrid
+  ## Configuration
+  ##
+  ## @param darwin.config Allows to customize the configuration files.
+  config:
+    ## @param darwin.configType Allows to set the configuration from ConfigMap or Configuration Service
+    ## It indicates the location from which the configuration is retrieved.
+    ## Four possible values are allowed:
+    ##  - "cm" links a Kubernetes ConfigMap with the name cm-{app_name}. It will be mounted.
+    ##  - "secret" links a Kubernetes Secret with the name secret-{app_name}. It will be mounted.
+    ##  - "cm-secret" links a Kubernetes ConfigMap with name cm-{app_name} and a Kubernetes Secret with name secret-{app_name}. They will be mounted.
+    ##  - "none" does not link any Kubernetes ConfigMap or Secret.
+    type: none
+    ## @param darwin.configuration.overrideCmName Override the default ConfigMap name
+    overrideConfigMapName:
+    ## @param darwin.configuration.overrideSecretName Override the default Secret name
+    overrideSecretName:
+  ## Internationalization
+  ##
+  ## @param darwin.i18n Allows to customize the internationalization files.
+  i18n:
+    ## @param i18n.enabled Allow customizing the internationalization files.
+    ##
+    enabled: false
+    ## @param i18n.path Define the path to store the literal and internationalization files, if is filled.
+    ## If it is not filled, the default path is '/etc/i18n/locales'.
+    path:
+    ## @param i18n.overrideConfigMapName Allows to override the name of the configuration Map that contains the files with the translations.
+    ## if it is not filled, the default name is i18n-{app_name}.
+    overrideConfigMapName:
+  nodejs:
+    env: DEV
+    cloud_config:
+      enable: true
+      failfast: true
+      # Values to connect with Configuration Service
+      uri: http://configuration-service:8080/
+      retry:
+        initialInterval : 3000
+        maxInterval : 6000
+        maxAttempts : 10
+    # Values for security module
+    security:
+      pkm:
+        uri: https://srvnuarintra.santander.dev.corp/pkm/v1/publicKey/
+    # Values for logger module
+    logger:
+      kafka:
+        host: 'kafkadarwin.santander.dev.corp:9092'

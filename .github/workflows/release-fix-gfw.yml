@@ -1,0 +1,15 @@
+name: Release fix
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  call-reusable-workflow:
+    name: Release fix
+    if: github.actor != 'gluon-app[bot]'
+    uses: santander-group-shared-assets/gln-workflows/.github/workflows/npm-release-tbd.yml@v1
+    with:
+      technology: 'npm'
+    secrets: inherit

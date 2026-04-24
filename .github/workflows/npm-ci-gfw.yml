@@ -1,0 +1,251 @@
+name: Npm snapshot image
+
+on:
+  workflow_call:
+    inputs:
+      gluon-runner:
+        required: false
+        type: string
+        description: '[Optional] Runner to be used to execute all jobs in this workflow'
+      runner:
+        required: false
+        type: string  
+        description: 'DEPRECATED'
+      technology:
+        required: true
+        type: string
+
+jobs:
+  setup-env-vars:
+    name: Setup environment variables
+    if: ${{ (github.event_name == 'push' && !endsWith(github.event.head_commit.message, '[--gluontask--]'))
+      	|| (github.event_name == 'pull_request' && !endsWith(github.event.pull_request.title, '[--gluontask--]')) 
+        || (github.event_name == 'release' && !endsWith(github.event.release.name, '[--gluontask--]'))
+        || (github.event_name != 'release' && github.event_name != 'pull_request' && github.event_name != 'push') 
+      }}
+    uses: santander-group-shared-assets/gln-multipurpose-child-reusable-workflows/.github/workflows/setup-env-vars.yml@v2.2.0
+    with:
+      runner: ${{ inputs.gluon-runner || 'base-runner' }}
+      repo: ${{ github.repository }}
+      repo-branch: ${{ github.ref}}
+    secrets: inherit
+    
+  check-deploy-target:
+    name: Verify Deploy Target
+    needs: [setup-env-vars]
+    uses: santander-group-shared-assets/gln-workflows/.github/workflows/verify-deploy-target.yml@v1.42.0
+    with:
+      gluon-runner: ${{ inputs.gluon-runner || 'base-runner' }}
+    secrets: inherit
+  
+  build-sonar:
+    name: Npm build & SonarQube
+    needs: [setup-env-vars, check-deploy-target]
+    if: ${{ !(github.event_name == 'pull_request' && needs.check-deploy-target.outputs.deploy-target-enabled =='false')}}
+    uses: santander-group-shared-assets/gln-npm-child-workflows/.github/workflows/npm-build-sonar.yml@v2.3.0
+    with:
+      runner: ${{ inputs.gluon-runner || 'npm-runner' }}
+      env-vars-json: ${{ needs.setup-env-vars.outputs.env-vars-json }}
+      git-ref: ${{ needs.check-deploy-target.outputs.ref-to-use  }}
+      technology: ${{ inputs.technology }}
+      qg-enabled: ${{
+        (contains(needs.check-deploy-target.outputs.ref-to-use , 'feature/') || contains(needs.check-deploy-target.outputs.ref-to-use , 'fix/'))
+         && contains(fromJson('["None","High"]'), fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED)}}
+      suffix-process: 'add'
+      suffix-version: 'BETA'
+    secrets: inherit
+
+  ssdlc-onboarding-check:
+    name: SSDLC Onboarding Check
+    needs: [setup-env-vars, build-sonar, check-deploy-target]
+    uses: santander-group-shared-assets/gln-detect-asm-ssdlc-workflows/.github/workflows/ssdlc-onboarding-check.yml@v5
+    if: |
+      always() && !cancelled() &&
+      needs.build-sonar.outputs.build-status == 'success' &&
+        ((contains(needs.check-deploy-target.outputs.ref-to-use, 'feature/') || contains(needs.check-deploy-target.outputs.ref-to-use, 'fix/')) &&
+        (fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED == 'None' ||
+          (fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED == 'High' && needs.build-sonar.result == 'success')))
+    with:
+      runs-on: ${{ inputs.gluon-runner || 'base-runner' }}
+      timeout-minutes: ${{ fromJSON(fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_TIMEOUT) }}
+      ssc_url: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_SSC_URL }}
+      sonatype_url: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).SONATYPE_URL }}
+      component: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+      version: ${{ needs.build-sonar.outputs.current-version }}   
+      check_waiver: 'true'
+    secrets: inherit
+  
+  sast:
+    name: SAST
+    needs: [setup-env-vars, build-sonar, ssdlc-onboarding-check, check-deploy-target]
+    uses: santander-group-shared-assets/gln-detect-asm-ssdlc-workflows/.github/workflows/sast.yml@v5
+    if: |
+      always() && !cancelled() &&
+      needs.build-sonar.outputs.build-status == 'success' &&
+        ((contains(needs.check-deploy-target.outputs.ref-to-use, 'feature/') || contains(needs.check-deploy-target.outputs.ref-to-use, 'fix/')) &&
+        (fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED == 'None' ||
+          (fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED == 'High' && needs.build-sonar.result == 'success')))
+    with:
+      runs-on: ${{ inputs.gluon-runner || 'npm-runner' }}
+      component: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+      version: ${{ needs.build-sonar.outputs.current-version }}
+      build_tool: 'none'
+      build_ops: ''
+      tools_and_versions: >
+        nodejs: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).NODE_VERSION }}
+      ssc_url: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_SSC_URL }}
+      sc_controller_url: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_SC_CONTROLLER_URL }}
+      timeout-minutes: ${{ fromJSON(fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_TIMEOUT) }}
+      criteria: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED }}
+      npm_settings: ${{ vars.NPM_SETTINGS_TEMPLATE || vars.NPM_SETTINGS_URL || fromJSON(needs.setup-env-vars.outputs.env-vars-json).NPM_SETTINGS_URL }}
+    secrets: inherit
+
+  sca:
+    name: SCA
+    needs: [setup-env-vars, build-sonar, ssdlc-onboarding-check, check-deploy-target]
+    uses: santander-group-shared-assets/gln-detect-asm-ssdlc-workflows/.github/workflows/sca.yml@v5
+    if: |
+      always() && !cancelled() &&
+      needs.build-sonar.outputs.build-status == 'success' &&
+        ((contains(needs.check-deploy-target.outputs.ref-to-use, 'feature/') || contains(needs.check-deploy-target.outputs.ref-to-use, 'fix/')) &&
+        (fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED == 'None' ||
+          (fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED == 'High' && needs.build-sonar.result == 'success')))
+    with:
+      runs-on: ${{ inputs.gluon-runner || 'npm-runner' }}
+      timeout-minutes: ${{ fromJSON(fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_TIMEOUT) }}
+      build_command: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).NPM_RUN_INSTALL_COMMAND }}
+      ssc_url: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).FORTIFY_SSC_URL }}
+      sonatype_url: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).SONATYPE_URL }}
+      component: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+      version: ${{ needs.build-sonar.outputs.current-version }}
+      criteria: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED }}
+      tools_and_versions: > 
+        nodejs:${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).NODE_VERSION }}
+      npm_settings: ${{ vars.NPM_SETTINGS_TEMPLATE || vars.NPM_SETTINGS_URL || fromJSON(needs.setup-env-vars.outputs.env-vars-json).NPM_SETTINGS_URL }}
+    secrets: inherit
+
+  send-data-to-elastic:
+    name: Send ${{ matrix.job-type }} information to data search engine tool
+    needs: [setup-env-vars, build-sonar, sast, sca]
+    if:  |
+      always() && needs.setup-env-vars.result=='success'
+      && needs.sast.result!='skipped' && needs.sca.result!='skipped' 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job-type: "fortify"
+            parameters: >
+              STATUS=${{ needs.sast.outputs.fortify-result }}
+              STAGE="Fortify-Sast"
+              URL=${{ needs.sast.outputs.version-url }}
+              CRITERIA=${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED }}
+              COMPONENT=${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+              COMPONENT_ID=${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+              VERSION=${{ needs.build-sonar.outputs.current-version }}
+          - job-type: "sonatype"
+            parameters: >
+              STATUS=${{ needs.sca.outputs.sonatype-result }}
+              STAGE="Sonatype-SCA"
+              URL=${{ needs.sca.outputs.version-url }}
+              CRITERIA=${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).QG_ENABLED }}
+              COMPONENT=${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+              COMPONENT_ID=${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+              VERSION=${{ needs.build-sonar.outputs.current-version }}
+    uses: santander-group-shared-assets/gln-multipurpose-child-reusable-workflows/.github/workflows/send-data-to-elastic.yml@v2.0.0
+    with:
+      runner: ${{ inputs.gluon-runner || 'base-runner' }}
+      env-vars-json: ${{ needs.setup-env-vars.outputs.env-vars-json }}
+      technology: ${{ inputs.technology }}
+      job-type: ${{ matrix.job-type }}
+      parameters: ${{ matrix.parameters }}
+    secrets: inherit
+
+  container-build-and-push:
+    name: Container build and push
+    needs: [setup-env-vars, build-sonar, sca, sast, check-deploy-target]
+    if: |
+      always() && !cancelled() &&
+      (needs.check-deploy-target.outputs.ref-to-use == 'development' || needs.check-deploy-target.outputs.ref-to-use == 'develop' || needs.check-deploy-target.outputs.deploy-target-enabled =='true') &&
+      needs.sca.result != 'failure' && needs.sast.result != 'failure' &&
+      needs.build-sonar.outputs.build-status == 'success'
+    # uses: santander-group-shared-assets/gln-multipurpose-child-reusable-workflows/.github/workflows/container-build-push-application.yml@v3.1.0
+    uses: ./.github/workflows/build-push-application.yml
+    with:
+      runner: ${{ inputs.gluon-runner || 'npm-runner' }}
+      env-vars-json: ${{ needs.setup-env-vars.outputs.env-vars-json }}
+      git-ref: ${{ needs.check-deploy-target.outputs.ref-to-use }}
+      technology: ${{ inputs.technology }}
+      environment_type: 'certification'
+      component: ${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).COMPONENT_ID }}
+      repository: "${{ github.server_url }}/${{ github.repository }}"
+      scan-image: 'false'
+      qg-enabled: false
+      tag-version: ${{ needs.check-deploy-target.outputs.deploy-target-enabled =='true' && needs.check-deploy-target.outputs.image-tag || '' }}
+      deploy-target-enabled: '${{ needs.check-deploy-target.outputs.deploy-target-enabled }}'
+    secrets: inherit
+
+  cd-workflow-initialization:
+    name: Launch deployment workflow execution
+    needs: [setup-env-vars, build-sonar, container-build-and-push, check-deploy-target]
+    if: |
+      always() && !cancelled() &&
+            (needs.check-deploy-target.outputs.ref-to-use == 'development' || needs.check-deploy-target.outputs.ref-to-use == 'develop' || needs.check-deploy-target.outputs.deploy-target-enabled =='true') &&
+      (needs.container-build-and-push.result == 'success')
+    runs-on: ${{ inputs.gluon-runner || 'base-runner'}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Get project token
+        id: get-project-token
+        if: ${{ needs.container-build-and-push.outputs.publish-artifact == 'true' }}
+        uses: santander-group-shared-assets/gln-get-github-app-token-action@1.2.0
+        with:
+          organization: ${{ github.repository_owner }}
+          app-id: ${{ secrets.APPLICATION_ID }}
+          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+      - name: Calling to CD workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=${{ needs.container-build-and-push.outputs.tag-version }}
+          
+          if [[ "true" == "${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).HELM_PACKAGE }}" && "helm" == "${{ fromJSON(needs.setup-env-vars.outputs.env-vars-json).IMAGE_DEPLOY_TYPE }}" ]]; then
+            version=${{ needs.container-build-and-push.outputs.tag-version }}
+          fi
+          
+          if [[ "${{ needs.container-build-and-push.outputs.publish-artifact }}" == 'true' ]]; then
+            # Store original GH_TOKEN
+            ORIGINAL_GH_TOKEN="$GH_TOKEN"
+            # Set GH_TOKEN to project token for this operation
+            export GH_TOKEN="${{ steps.get-project-token.outputs.token }}"
+
+            gh variable set ARTIFACT_VERSION --body "${{ needs.build-sonar.outputs.current-version }}"
+
+            # Restore original GH_TOKEN
+            export GH_TOKEN="$ORIGINAL_GH_TOKEN"
+          fi
+          
+          echo -e "{\"environment-type\":\"certification\", ${{ needs.check-deploy-target.outputs.deploy-target-enabled =='true' && format('\"environment\":\"{0}\",',needs.check-deploy-target.outputs.deploy-target-environment) || '' }} \
+                    \"version\":\"$version\" }" | gh workflow run cd.yml --ref ${{ needs.check-deploy-target.outputs.ref-to-use }} --json
+          
+          
+          end_time=$((SECONDS + 60))
+          run_url=""
+
+          while [ $SECONDS -lt $end_time ]; do
+            run_url=$(gh run list --workflow=cd.yml --json headBranch,url,status,createdAt --limit 5 | jq -r --arg branch "${{ github.ref_name }}" '
+              .[] | select(.headBranch == $branch and .status == "in_progress") | .url' | head -n 1)
+            if [ -n "$run_url" ]; then
+              break
+            fi
+
+            sleep 5
+          done
+          
+          if [ -z "$run_url" ]; then
+            echo "::error::No in-progress run found for the branch ${{ github.ref_name }}."
+          else
+            echo "::notice::CD workflow run URL: $run_url"
+          fi
