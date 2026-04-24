@@ -1,0 +1,133 @@
+##############################################################################
+# DEPLOYMENT — sur-appcli-customer-access-identity-api
+# Backend COBIS Customer Integration
+# - Pull desde ACR privado (perd3zu1acrcapgobcomm001)
+# - Node selector: user-2
+# - Puerto: 8080
+# - Cluster: perd3zu1akscapintcomm001 (Integración)
+##############################################################################
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: sur-appcli-customer-access-identity-api-deployment
+  namespace: appcliente-ns
+
+spec:
+  replicas: 1
+
+  # Tiempo máximo para que un rollout progrese (10 min)
+  progressDeadlineSeconds: 600
+
+  selector:
+    matchLabels:
+      app: sur-appcli-customer-access-identity-api
+
+  # Recreate: mata el pod viejo antes de crear el nuevo
+  strategy:
+    type: Recreate
+
+  template:
+    metadata:
+      labels:
+        app: sur-appcli-customer-access-identity-api
+
+    spec:
+      # --- Node Selector: solo nodos user, pool user-2 ---
+      nodeSelector:
+        kubernetes.azure.com/mode: user
+        kubernetes.sds.com/pool: user-2
+
+      # --- Tolerations: permite entrar en nodos con taint CriticalAddonsOnly ---
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Exists
+          effect: NoSchedule
+
+      containers:
+        - name: sur-appcli-customer-access-identity-api
+
+          # ── Imagen desde ACR privado ──
+          image: perd3zu1acrcapgobcomm001.azurecr.io/santander-group-sur-gln/sur-appcli-customer-access-identity-api:development
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8085
+
+          # ── Command: construir CA bundle y arrancar Node.js ──
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              CORP_CERT="/opt/produban/Santander_Unique_Cert.pem"
+              UMBRELLA_CERT="/opt/produban/input-cas/umbrella.cer"
+              CA_CERT="/etc/pki/tls/certs/ca-bundle.crt"
+              OUT_CERT="/opt/produban/ca/custom-ca-bundle.pem"
+              if [ ! -f "$CORP_CERT" ]; then
+                echo "[build-ca-bundle] Missing corporate cert: $CORP_CERT" >&2
+                exit 1
+              fi
+              if [ ! -f "$UMBRELLA_CERT" ]; then
+                echo "[build-ca-bundle] Missing umbrella cert: $UMBRELLA_CERT" >&2
+                exit 1
+              fi
+              mkdir -p "$(dirname "$OUT_CERT")"
+              cat "$CORP_CERT" > "$OUT_CERT"
+              printf "\n" >> "$OUT_CERT"
+              cat "$CA_CERT" >> "$OUT_CERT"
+              printf "\n" >> "$OUT_CERT"
+              cat "$UMBRELLA_CERT" >> "$OUT_CERT"
+              if ! grep -q "BEGIN CERTIFICATE" "$OUT_CERT"; then
+                echo "[build-ca-bundle] Output bundle doesn't look like PEM: $OUT_CERT" >&2
+                exit 1
+              fi
+              echo "[build-ca-bundle] Wrote CA bundle to $OUT_CERT"
+              cd /opt/produban
+              exec ./control.sh start
+
+          # ── Recursos (ajustar según necesidad) ──
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 200m
+              memory: 512Mi
+
+          # ── Variables de entorno ──
+          env:
+            # ── Certificados CA ──
+            - name: NODE_EXTRA_CA_CERTS
+              value: /opt/produban/ca/custom-ca-bundle.pem
+            - name: NODE_USE_ENV_PROXY
+              value: "1"
+
+          # ── ConfigMap con proxy y variables de entorno ──
+          envFrom:
+            - configMapRef:
+                name: sur-appcli-payments-api-configmap
+
+          # ── Volume Mounts ──
+          volumeMounts:
+            # Directorio temporal para el bundle CA combinado
+            - name: ca-bundle
+              mountPath: /opt/produban/ca
+            # Certificado Umbrella (desde K8s Secret)
+            - name: umbrella-ca-secret
+              mountPath: /opt/produban/input-cas
+              readOnly: true
+
+      # ── Volumes ──
+      volumes:
+        # emptyDir para el CA bundle generado
+        - name: ca-bundle
+          emptyDir: {}
+        # Secret con el certificado Umbrella
+        - name: umbrella-ca-secret
+          secret:
+            secretName: umbrella-ca
+            items:
+              - key: umbrella.cer
+                path: umbrella.cer
+
